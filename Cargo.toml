@@ -1,0 +1,27 @@
+[package]
+name = "transfer-files"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Local dual-pane prototype for a two-stage SSH file transfer client"
+build = "build.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "unstable-winit-030"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+x11rb = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+i-slint-backend-testing = { version = "=1.18.1", features = ["renderer-software"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = "thin"

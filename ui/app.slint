@@ -1,0 +1,228 @@
+import { Button, CheckBox, LineEdit, ProgressIndicator, ListView, TextEdit } from "std-widgets.slint";
+
+export struct FileRow {
+    name: string,
+    kind: string,
+    size: string,
+    modified: string,
+    directory: bool,
+    selected: bool,
+}
+
+component FilePane inherits Rectangle {
+    in property <string> heading;
+    in property <string> subtitle;
+    in-out property <string> path;
+    in property <[FileRow]> rows;
+    in property <bool> active;
+    in property <bool> loading;
+    in property <bool> busy;
+    in property <int> revision;
+    in property <string> summary;
+    callback navigate(string);
+    callback parent-directory();
+    callback refresh();
+    callback toggle(int);
+    callback open(int);
+    callback select-all();
+    callback clear-selection();
+    callback activate();
+    pure callback make-payload(int, int) -> data-transfer;
+    callback accept-drop(DropEvent) -> DragAction;
+    callback receive-drop(DropEvent);
+
+    background: #ffffff;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.active ? #178477 : #dce2e7;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        HorizontalLayout {
+            Text { text: root.heading; color: #182d38; font-size: 18px; font-weight: 700; }
+            Button { text: root.active ? "外部拖入目标 ✓" : "设为外部拖入目标"; enabled: !root.busy; clicked => { root.activate(); } }
+        }
+        Text { text: root.subtitle; color: #667782; font-size: 12px; }
+        HorizontalLayout {
+            spacing: 6px;
+            Button { text: "上级"; enabled: !root.loading; clicked => { root.parent-directory(); } }
+            path-input := LineEdit {
+                text <=> root.path;
+                enabled: !root.loading;
+                accepted => { root.navigate(self.text); }
+            }
+            Button { text: "前往"; enabled: !root.loading; clicked => { root.navigate(root.path); } }
+            Button { text: "刷新"; enabled: !root.loading; clicked => { root.refresh(); } }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Button { text: "全选"; enabled: !root.loading; clicked => { root.select-all(); } }
+            Button { text: "清空选择"; clicked => { root.clear-selection(); } }
+            Text { text: root.loading ? "正在读取目录…" : root.summary; color: #667782; horizontal-alignment: right; }
+        }
+        Rectangle {
+            background: #f1f5f6;
+            height: 28px;
+            HorizontalLayout {
+                padding-left: 12px; padding-right: 12px;
+                Text { text: "名称（双击打开目录，勾选多项后拖拽）"; color: #526570; font-size: 12px; }
+                Text { text: "大小"; width: 82px; color: #526570; horizontal-alignment: right; font-size: 12px; }
+            }
+        }
+        // Empty space remains a valid drop target; children provide row interaction.
+        DropArea {
+            can-drop(event) => { return root.accept-drop(event); }
+            dropped(event) => { root.receive-drop(event); return DragAction.copy; }
+            Rectangle {
+                border-width: parent.has-drag ? 2px : 0px;
+                border-color: #178477;
+                background: parent.has-drag ? #edf9f5 : #ffffff;
+                ListView {
+                    content-width: self.visible-width;
+                        for row[index] in root.rows : DragArea {
+                            height: 42px;
+                            enabled: !root.busy && !root.loading;
+                            allow-copy: true;
+                            data: root.make-payload(index, root.revision);
+                            Rectangle {
+                                background: row.selected ? #dff2ec : (index / 2 == floor(index / 2) ? #ffffff : #f8fafb);
+                                HorizontalLayout {
+                                    padding-left: 6px; padding-right: 10px; spacing: 8px;
+                                    CheckBox { checked: row.selected; toggled => { root.toggle(index); } }
+                                    Text { text: row.kind; width: 40px; color: #178477; font-size: 11px; }
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        VerticalLayout {
+                                            spacing: 0px;
+                                            Text { text: row.name; vertical-alignment: center; overflow: elide; color: #233843; }
+                                            Text { text: row.modified; color: #667782; font-size: 10px; }
+                                        }
+                                        row-touch := TouchArea {
+                                            clicked => { root.toggle(index); }
+                                            double-clicked => { root.open(index); }
+                                        }
+                                    }
+                                    Text { text: row.size; width: 82px; horizontal-alignment: right; vertical-alignment: center; color: #667782; font-size: 12px; }
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        Text { text: "拖入始终复制到本栏当前目录；不以悬停行作为目标"; color: #667782; font-size: 11px; }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Transfer Files · 本地双栏原型";
+    preferred-width: 1180px;
+    preferred-height: 800px;
+    min-width: 920px;
+    min-height: 620px;
+    background: #edf1f3;
+    in property <[FileRow]> left-rows;
+    in property <[FileRow]> right-rows;
+    in property <string> left-path;
+    in property <string> right-path;
+    in property <string> left-summary;
+    in property <string> right-summary;
+    in property <bool> left-loading;
+    in property <bool> right-loading;
+    in property <int> active-pane;
+    in property <int> revision;
+    in property <bool> busy;
+    in property <float> progress;
+    in property <string> status: "准备就绪";
+    in property <string> detail;
+    in property <string> history;
+    callback navigate(int, string);
+    callback parent-directory(int);
+    callback refresh(int);
+    callback toggle(int, int);
+    callback open(int, int);
+    callback select-all(int);
+    callback clear-selection(int);
+    callback activate(int);
+    pure callback make-payload(int, int, int) -> data-transfer;
+    callback accept-drop(int, DropEvent) -> DragAction;
+    callback receive-drop(int, DropEvent);
+    callback copy-selected(int);
+    callback cancel();
+
+    // Used by the X11 native file-drop adapter; coordinates are logical pixels.
+    public pure function pane-at(x: float, y: float) -> int {
+        if (x >= left-pane.absolute-position.x / 1px && x < (left-pane.absolute-position.x + left-pane.width) / 1px
+            && y >= left-pane.absolute-position.y / 1px && y < (left-pane.absolute-position.y + left-pane.height) / 1px) { return 0; }
+        if (x >= right-pane.absolute-position.x / 1px && x < (right-pane.absolute-position.x + right-pane.width) / 1px
+            && y >= right-pane.absolute-position.y / 1px && y < (right-pane.absolute-position.y + right-pane.height) / 1px) { return 1; }
+        return -1;
+    }
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+        HorizontalLayout {
+            Text { text: "TRANSFER FILES"; color: #173b3d; font-size: 23px; font-weight: 800; }
+            Text { text: "本地验证 / 两栏都访问当前电脑"; color: #667782; horizontal-alignment: right; }
+        }
+        Text { text: "勾选文件后拖到另一栏，或使用复制按钮。同名目标跳过，源文件始终保留。"; color: #526570; font-size: 13px; }
+        HorizontalLayout {
+            spacing: 12px;
+            left-pane := FilePane {
+                heading: "左侧文件"; subtitle: "当前电脑 · 本地目录";
+                path: root.left-path; rows: root.left-rows;
+                summary: root.left-summary; loading: root.left-loading;
+                active: root.active-pane == 0; busy: root.busy; revision: root.revision;
+                navigate(path) => { root.navigate(0, path); }
+                parent-directory => { root.parent-directory(0); }
+                refresh => { root.refresh(0); }
+                toggle(index) => { root.toggle(0, index); }
+                open(index) => { root.open(0, index); }
+                select-all => { root.select-all(0); }
+                clear-selection => { root.clear-selection(0); }
+                activate => { root.activate(0); }
+                make-payload(index, rev) => { return root.make-payload(0, index, rev); }
+                accept-drop(event) => { return root.accept-drop(0, event); }
+                receive-drop(event) => { root.receive-drop(0, event); }
+            }
+            right-pane := FilePane {
+                heading: "右侧文件"; subtitle: "当前电脑 · 用作目标端模拟";
+                path: root.right-path; rows: root.right-rows;
+                summary: root.right-summary; loading: root.right-loading;
+                active: root.active-pane == 1; busy: root.busy; revision: root.revision;
+                navigate(path) => { root.navigate(1, path); }
+                parent-directory => { root.parent-directory(1); }
+                refresh => { root.refresh(1); }
+                toggle(index) => { root.toggle(1, index); }
+                open(index) => { root.open(1, index); }
+                select-all => { root.select-all(1); }
+                clear-selection => { root.clear-selection(1); }
+                activate => { root.activate(1); }
+                make-payload(index, rev) => { return root.make-payload(1, index, rev); }
+                accept-drop(event) => { return root.accept-drop(1, event); }
+                receive-drop(event) => { root.receive-drop(1, event); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            Button { text: "左侧选中 → 右侧"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(0); } }
+            Button { text: "左侧 ← 右侧选中"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(1); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "取消当前批次"; enabled: root.busy; clicked => { root.cancel(); } }
+        }
+        Rectangle {
+            background: #ffffff;
+            border-radius: 8px;
+            min-height: 162px;
+            max-height: 162px;
+            VerticalLayout {
+                padding: 12px; spacing: 6px;
+                Text { text: root.status; color: #173b3d; font-weight: 600; overflow: elide; }
+                ProgressIndicator { progress: root.progress; }
+                Text { text: root.detail; color: #526570; font-size: 12px; overflow: elide; }
+                TextEdit { text: root.history; read-only: true; font-size: 11px; }
+            }
+        }
+    }
+}
