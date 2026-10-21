@@ -2,7 +2,7 @@
 
 Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 跳板机 → 家里 Windows”的两段传输客户端验证交互。
 
-**当前两栏都操作运行程序的电脑上的真实本地文件。尚未接入 SSH、密码认证或远端 Windows。**
+**当前两栏都操作运行程序的电脑上的真实本地文件。尚未接入 SSH、密码认证或远端 Windows，因此当前版本没有“远程设置”入口。**
 
 ![双栏原型界面](docs/images/prototype.png)
 
@@ -28,6 +28,21 @@ Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 
 ```bash
 cargo run --locked
 ```
+
+这是开发运行方式。首次验证完成后，可以构建一次 Release 版本，之后直接启动编译好的程序：
+
+```bash
+cargo build --release --locked
+./target/release/transfer-files
+```
+
+也可以使用仓库提供的一键启动脚本。脚本只在 Release 程序不存在时构建，后续启动直接运行程序，不需要每次重新编译：
+
+```bash
+bash scripts/run.sh
+```
+
+如果希望从 KDE 应用菜单启动，可以把 `scripts/run.sh` 添加为桌面快捷方式；脚本所在的项目目录需要保留不变。源代码更新后重新执行一次 `cargo build --release --locked` 即可。
 
 两栏默认打开当前目录。可指定不同的初始目录，路径含空格时加引号：
 
@@ -98,6 +113,7 @@ ui/app.slint                    双栏界面
 docs/development-requirements.md 完整需求与后续 SSH 方案
 docs/prototype-validation.md    目标机验收与当前验证记录
 scripts/create-demo.sh          创建本地人工测试目录
+scripts/run.sh                  构建（必要时）并启动 Release 程序
 ```
 
 Slint 资料：[渲染后端](https://docs.slint.dev/latest/docs/slint/guide/backends-and-renderers/backends_and_renderers/)、[拖放接口](https://docs.slint.dev/latest/docs/slint/reference/drag-and-drop/dragarea/)。
