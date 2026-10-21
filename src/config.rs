@@ -16,6 +16,10 @@ pub struct RemoteConfig {
 }
 
 impl RemoteConfig {
+    pub fn is_configured(&self) -> bool {
+        self.validate().is_ok()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let required = [
             ("跳板机地址", &self.jump_host),
@@ -26,6 +30,17 @@ impl RemoteConfig {
         for (label, value) in required {
             if value.trim().is_empty() {
                 return Err(format!("{label}不能为空"));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(format!("{label}不能包含换行或控制字符"));
+            }
+        }
+        for (label, host) in [
+            ("跳板机地址", &self.jump_host),
+            ("Windows 地址", &self.windows_host),
+        ] {
+            if host.starts_with('-') || host.chars().any(char::is_whitespace) {
+                return Err(format!("{label}不能以 - 开头或包含空白"));
             }
         }
         for (label, value) in [
@@ -39,8 +54,8 @@ impl RemoteConfig {
                 return Err(format!("{label}必须是 1 到 65535 的数字"));
             }
         }
-        if self.windows_root.contains(['\r', '\n']) {
-            return Err("Windows 默认目录不能包含换行".into());
+        if self.windows_root.is_empty() || self.windows_root.contains(['\r', '\n', '\0']) {
+            return Err("Windows 默认目录不能为空或包含换行、空字符".into());
         }
         Ok(())
     }

@@ -2,21 +2,22 @@
 
 Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 跳板机 → 家里 Windows”的两段传输客户端验证交互。
 
-**当前两栏都操作运行程序的电脑上的真实本地文件。尚未接入 SSH、密码认证或远端 Windows；“远程设置”目前只保存连接参数。**
+**已接入 Linux 客户端的两段 SSH 认证和 Windows 目录浏览。保存远程配置后，左栏为本地、右栏为远程；点击读取时连接，完成后断开并保留目录快照。远程上传、下载和向 Dolphin 拖出尚未实现。**
 
-![双栏原型界面](docs/images/prototype.png)
+![远程浏览原型界面](docs/images/remote-browser.png)
 
-截图由 Linux 无窗口软件渲染测试生成，展示本地双向复制完成后的界面；不是龙芯实机截图。
+截图由无窗口软件渲染测试注入模拟远程结果生成，用于检查布局；不是真实 SSH 或龙芯实机截图。
 
 ## 功能
 
 - 双栏目录浏览，路径输入、上级、刷新；目录优先、名称排序，显示大小与 UTC 修改时间。
 - 勾选多项、全选、清空选择；双击目录进入。
-- 从一栏拖到另一栏复制；也可使用中间的双向复制按钮。
-- 从 Dolphin 拖入文件、多个文件、目录，作为一个批次复制。
+- 本地验证模式：内部双向拖拽复制，也支持 Dolphin 拖入文件、多个文件、目录。
 - 后台扫描及复制、字节进度、错误日志、取消。
 - 同名目标跳过，源文件保留；目录同名整体跳过，不合并。
-- “远程设置”窗口可保存跳板机与 Windows 的连接参数；密码不会保存。
+- “远程设置”保存非敏感参数；连接时在 GUI 分别输入两端密码，首次连接显示主机指纹确认。
+- 远程模式：读取、双击目录、上级和刷新都会单独连接，完成后断开；当前目录快照保留在内存中，标注读取时间，失败时保留旧快照。
+- 远程面板暂时只读，此模式下复制按钮及拖放复制均禁用。
 
 ## 在龙芯 Linux 上运行
 
@@ -45,9 +46,21 @@ bash scripts/run.sh
 
 如果希望从 KDE 应用菜单启动，可以把 `scripts/run.sh` 添加为桌面快捷方式；脚本所在的项目目录需要保留不变。源代码更新后重新执行一次 `cargo build --release --locked` 即可。
 
-启动后点击右上角“远程设置”，填写跳板机地址、端口、用户名，以及家里 Windows 的 Tailscale 地址、SSH 端口、用户名和默认目录。当前版本只保存这些参数并显示保存位置，不会发起连接；密码也不会写入磁盘。Linux 默认保存到 `~/.config/transfer-files/config.conf`。
+## 读取家里 Windows 的目录
 
-两栏默认打开当前目录。可指定不同的初始目录，路径含空格时加引号：
+1. 点击右上角“远程设置”，填写跳板机地址、端口、用户名，以及家里 Windows 的 Tailscale 地址、SSH 端口、用户名和默认目录，例如 `C:/Users/你的用户名`。
+2. 保存后右栏切换为远程面板，点击“读取远程目录”。保存设置和启动程序都不会自动连接。
+3. 若遇到新主机，核对弹窗中的主机指纹后确认。跳板机的信任记录保存在公司电脑，Windows 的信任记录保存在跳板机，沿用两端 OpenSSH 的 `known_hosts`。
+4. 按提示分别输入跳板机和 Windows 密码。若已有可用密钥，OpenSSH 可能直接认证成功；不要求每次一定出现两次密码框。
+5. 读完显示“SSH 已断开”。双击目录、点击上级或刷新时，会重新连接认证；当前仅缓存最近一次成功读取的目录，不在磁盘保存目录快照。
+
+Linux 默认配置位置为 `~/.config/transfer-files/config.conf`，支持 `XDG_CONFIG_HOME`；密码不写入配置、命令参数、环境变量或日志。GUI 等待认证最多两分钟，网络读取空闲超时 60 秒，目录响应上限 16 MiB。取消或关闭窗口会请求终止本应用的 SSH 并等待清理。
+
+前提：公司电脑和 Linux 跳板机已有 `ssh`，跳板机允许分配 SSH 终端并能运行 POSIX shell、`stty`、`env`；Windows OpenSSH 可运行 `powershell.exe`（Windows PowerShell 5.1）。无需安装跳板机辅助服务，不使用 ProxyJump、端口转发或额外隧道。当前适配普通密码、公钥及私钥口令提示；自定义 MFA/OTP、keyboard-interactive 提示尚不支持。远程浏览仅支持 Linux 客户端，Windows 构建用于本地交互和 PowerShell 协议验证。
+
+更新源码后必须先执行 `cargo build --release --locked`，再启动程序；启动脚本不会自动重建已有程序。
+
+未配置远程时，两栏默认打开当前目录。传入两个目录参数可强制进入本地验证模式，路径含空格时加引号：
 
 ```bash
 cargo run --locked -- "$HOME/Downloads" "$HOME/Documents"
@@ -65,7 +78,7 @@ WINIT_UNIX_BACKEND=x11 cargo run --locked
 sudo apt install build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libx11-dev libxcb1-dev
 ```
 
-## 操作方式
+## 本地验证模式操作方式
 
 1. 左栏打开源目录，右栏打开另一个已有目录。
 2. 勾选源文件，拖动其中一个已勾选的文件行到另一栏的文件列表；选中的项目将一并复制。
@@ -113,6 +126,9 @@ cargo test --locked
 src/main.rs                     界面控制、目录工作线程、拖放适配、批次进度
 src/config.rs                   远程连接参数的加载、校验和保存（不含密码）
 src/files.rs                    本地目录读取与可取消的复制引擎
+src/remote.rs                   Windows 路径处理与远程读取入口
+src/remote/terminal.rs          Linux PTY、两段 SSH、认证与进程清理
+src/remote/protocol.rs          PowerShell 脚本与带版本边界的目录协议
 ui/app.slint                    双栏界面
 docs/development-requirements.md 完整需求与后续 SSH 方案
 docs/prototype-validation.md    目标机验收与当前验证记录

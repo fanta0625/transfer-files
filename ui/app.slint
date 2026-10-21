@@ -17,6 +17,8 @@ component FilePane inherits Rectangle {
     in property <bool> active;
     in property <bool> loading;
     in property <bool> busy;
+    in property <bool> remote;
+    in property <bool> transfer-enabled: true;
     in property <int> revision;
     in property <string> summary;
     callback navigate(string);
@@ -41,7 +43,7 @@ component FilePane inherits Rectangle {
         spacing: 8px;
         HorizontalLayout {
             Text { text: root.heading; color: #182d38; font-size: 18px; font-weight: 700; }
-            Button { text: root.active ? "外部拖入目标 ✓" : "设为外部拖入目标"; enabled: !root.busy; clicked => { root.activate(); } }
+            Button { text: root.active ? "外部拖入目标 ✓" : "设为外部拖入目标"; visible: root.transfer-enabled; enabled: !root.busy; clicked => { root.activate(); } }
         }
         Text { text: root.subtitle; color: #667782; font-size: 12px; }
         HorizontalLayout {
@@ -66,7 +68,7 @@ component FilePane inherits Rectangle {
             height: 28px;
             HorizontalLayout {
                 padding-left: 12px; padding-right: 12px;
-                Text { text: "名称（双击打开目录，勾选多项后拖拽）"; color: #526570; font-size: 12px; }
+                Text { text: root.transfer-enabled ? "名称（双击打开目录，勾选多项后拖拽）" : "名称（双击打开目录）"; color: #526570; font-size: 12px; }
                 Text { text: "大小"; width: 82px; color: #526570; horizontal-alignment: right; font-size: 12px; }
             }
         }
@@ -83,7 +85,7 @@ component FilePane inherits Rectangle {
                         for row[index] in root.rows : DragArea {
                             height: 42px;
                             enabled: !root.busy && !root.loading;
-                            allow-copy: true;
+                            allow-copy: root.transfer-enabled && !root.remote;
                             data: root.make-payload(index, root.revision);
                             Rectangle {
                                 background: row.selected ? #dff2ec : (index / 2 == floor(index / 2) ? #ffffff : #f8fafb);
@@ -110,7 +112,7 @@ component FilePane inherits Rectangle {
                 }
             }
         }
-        Text { text: "拖入始终复制到本栏当前目录；不以悬停行作为目标"; color: #667782; font-size: 11px; }
+        Text { text: root.transfer-enabled ? "拖入始终复制到本栏当前目录；不以悬停行作为目标" : (root.remote ? "目录快照 · 双击文件夹会重新连接读取" : "本地目录 · 当前远程版本暂未支持传输"); color: #667782; font-size: 11px; }
     }
 }
 
@@ -132,6 +134,16 @@ export component AppWindow inherits Window {
     in property <int> active-pane;
     in property <int> revision;
     in property <bool> busy;
+    in property <bool> right-remote;
+    in property <bool> remote-reading;
+    in property <string> remote-snapshot;
+    in property <bool> auth-visible;
+    in property <bool> auth-host-key;
+    in property <string> auth-title;
+    in property <string> auth-detail;
+    in-out property <string> auth-secret;
+    callback auth-submit();
+    callback auth-cancel();
     in property <float> progress;
     in property <string> status: "准备就绪";
     in property <string> detail;
@@ -144,6 +156,7 @@ export component AppWindow inherits Window {
     in-out property <string> setting-windows-user;
     in-out property <string> setting-windows-root;
     in property <bool> settings-visible;
+    in property <string> settings-error;
     callback navigate(int, string);
     callback parent-directory(int);
     callback refresh(int);
@@ -176,13 +189,15 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             Text { text: "TRANSFER FILES"; color: #173b3d; font-size: 23px; font-weight: 800; }
             Rectangle { horizontal-stretch: 1; }
-            Button { text: "远程设置"; enabled: !root.busy; clicked => { root.show-settings(); } }
+            Button { text: root.remote-reading ? "读取中…" : "读取远程目录"; enabled: root.right-remote && !root.remote-reading && !root.busy; clicked => { root.refresh(1); } }
+            Button { text: "远程设置"; enabled: !root.busy && !root.remote-reading; clicked => { root.show-settings(); } }
         }
-        Text { text: "勾选文件后拖到另一栏，或使用复制按钮。同名目标跳过，源文件始终保留。"; color: #526570; font-size: 13px; }
+        Text { text: root.right-remote ? "远程浏览模式 · 点击「读取远程目录」连接；读完断开。当前版本暂不支持远程复制。" : "本地验证模式 · 两栏均为当前电脑目录。配置远程后可读取 Windows 目录。"; color: #526570; font-size: 13px; }
         HorizontalLayout {
             spacing: 12px;
             left-pane := FilePane {
-                heading: "左侧文件"; subtitle: "当前电脑 · 本地目录";
+                transfer-enabled: !root.right-remote;
+                heading: "左侧文件"; subtitle: "当前电脑 · 本地目录"; remote: false;
                 path: root.left-path; rows: root.left-rows;
                 summary: root.left-summary; loading: root.left-loading;
                 active: root.active-pane == 0; busy: root.busy; revision: root.revision;
@@ -199,7 +214,9 @@ export component AppWindow inherits Window {
                 receive-drop(event) => { root.receive-drop(0, event); }
             }
             right-pane := FilePane {
-                heading: "右侧文件"; subtitle: "当前电脑 · 用作目标端模拟";
+                transfer-enabled: !root.right-remote;
+                heading: "右侧文件"; subtitle: root.right-remote ? (root.remote-reading ? "家里 Windows · 正在连接读取…" : "家里 Windows · " + root.remote-snapshot) : "当前电脑 · 用作目标端模拟";
+                remote: root.right-remote;
                 path: root.right-path; rows: root.right-rows;
                 summary: root.right-summary; loading: root.right-loading;
                 active: root.active-pane == 1; busy: root.busy; revision: root.revision;
@@ -218,10 +235,10 @@ export component AppWindow inherits Window {
         }
         HorizontalLayout {
             spacing: 10px;
-            Button { text: "左侧选中 → 右侧"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(0); } }
-            Button { text: "左侧 ← 右侧选中"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(1); } }
+            Button { text: "左侧选中 → 右侧"; enabled: !root.right-remote && !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(0); } }
+            Button { text: "左侧 ← 右侧选中"; enabled: !root.right-remote && !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(1); } }
             Rectangle { horizontal-stretch: 1; }
-            Button { text: "取消当前批次"; enabled: root.busy; clicked => { root.cancel(); } }
+            Button { text: root.remote-reading ? "取消远程读取" : "取消当前批次"; enabled: root.busy || root.remote-reading; clicked => { root.cancel(); } }
         }
         Rectangle {
             background: #ffffff;
@@ -241,6 +258,7 @@ export component AppWindow inherits Window {
     if root.settings-visible : Rectangle {
         x: 0px; y: 0px; width: root.width; height: root.height;
         background: #00000055;
+        TouchArea { }
         Rectangle {
             x: (root.width - 620px) / 2;
             y: (root.height - 580px) / 2;
@@ -273,7 +291,7 @@ export component AppWindow inherits Window {
                 Text { text: "家里 Windows SSH"; color: #178477; font-size: 14px; font-weight: 700; }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "Tailscale 地址"; width: 76px; vertical-alignment: center; }
+                    Text { text: "Windows 地址"; width: 76px; vertical-alignment: center; }
                     LineEdit { text <=> root.setting-windows-host; placeholder-text: "例如 100.64.0.2"; }
                     Text { text: "端口"; width: 45px; vertical-alignment: center; }
                     LineEdit { text <=> root.setting-windows-port; width: 80px; placeholder-text: "22"; }
@@ -289,9 +307,10 @@ export component AppWindow inherits Window {
                     LineEdit { text <=> root.setting-windows-root; placeholder-text: "例如 C:/Users/你的用户名"; }
                 }
                 Text {
-                    text: "当前阶段只保存连接参数；点击保存不会发起连接。SSH 目录读取和两段传输将在下一阶段接入。";
+                    text: "保存后右栏切换为 Windows 远程面板。点击主窗口「读取远程目录」时连接，完成后断开；文件传输尚未接入。";
                     color: #8a5a20; font-size: 12px; wrap: word-wrap;
                 }
+                Text { text: root.settings-error; color: #b32f2f; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     spacing: 8px;
@@ -311,6 +330,30 @@ export component AppWindow inherits Window {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if root.auth-visible : Rectangle {
+        width: root.width; height: root.height; background: #00000066;
+        TouchArea { } // Block the underlying file panes while authenticating.
+        Rectangle {
+            x: (root.width - 650px) / 2; y: (root.height - 370px) / 2;
+            width: 650px; height: 370px; background: #ffffff; border-radius: 10px;
+            VerticalLayout {
+                padding: 22px; spacing: 14px;
+                Text { text: root.auth-title; font-size: 20px; font-weight: 700; color: #173b3d; }
+                TextEdit { text: root.auth-detail; read-only: true; font-size: 13px; }
+                if !root.auth-host-key : LineEdit {
+                    text <=> root.auth-secret; input-type: password;
+                    placeholder-text: "密码或私钥口令（不保存）";
+                    accepted => { root.auth-submit(); }
+                }
+                HorizontalLayout {
+                    spacing: 10px; Rectangle { horizontal-stretch: 1; }
+                    Button { text: root.auth-host-key ? "拒绝并断开" : "取消"; clicked => { root.auth-cancel(); } }
+                    Button { text: root.auth-host-key ? "核对后信任此主机" : "确认"; clicked => { root.auth-submit(); } }
                 }
             }
         }

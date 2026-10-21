@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
-description = "Local dual-pane prototype for a two-stage SSH file transfer client"
+description = "Dual-pane client for two-stage SSH file browsing and transfers"
 build = "build.rs"
 
 [dependencies]
+base64 = "0.23"
+zeroize = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "unstable-winit-030"] }
 
@@ -15,6 +17,7 @@ slint = { version = "=1.18.1", default-features = false, features = ["std", "bac
 slint-build = "=1.18.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+portable-pty = "0.9"
 raw-window-handle = "0.6"
 x11rb = "0.13"
 

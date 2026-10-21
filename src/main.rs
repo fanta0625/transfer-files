@@ -1,5 +1,6 @@
 mod config;
 mod files;
+mod remote;
 
 use slint::{
     ComponentHandle, DataTransfer, Model, ModelRc, Timer, TimerMode, VecModel, language::DragAction,
@@ -19,20 +20,24 @@ use std::{
 };
 
 use config::RemoteConfig;
+use zeroize::Zeroizing;
 
 slint::include_modules!();
 
 #[derive(Default)]
 struct Pane {
     path: PathBuf,
+    remote: bool,
     entries: Vec<files::Entry>,
     selected: HashSet<PathBuf>,
     generation: u64,
     loading: bool,
+    snapshot_time: Option<String>,
 }
 
 enum Event {
     Directory(usize, u64, std::io::Result<(PathBuf, Vec<files::Entry>)>),
+    RemotePrompt(u64, remote::Prompt, Sender<remote::Answer>),
     Progress(files::Progress),
     Finished(files::Report),
 }
@@ -40,6 +45,9 @@ enum Event {
 struct State {
     panes: [Pane; 2],
     remote_config: RemoteConfig,
+    remote_cancel: Arc<AtomicBool>,
+    remote_worker: Option<thread::JoinHandle<()>>,
+    auth_reply: Option<Sender<remote::Answer>>,
     tx: Sender<Event>,
     cancel: Arc<AtomicBool>,
     busy: bool,
@@ -128,6 +136,16 @@ fn paint_pane(ui: &AppWindow, state: &Shared, side: usize) {
         ui.set_right_path(path.into());
         ui.set_right_summary(summary.into());
         ui.set_right_loading(loading);
+        let state = state.borrow();
+        ui.set_right_remote(state.panes[1].remote);
+        ui.set_remote_snapshot(
+            state.panes[1]
+                .snapshot_time
+                .clone()
+                .map(|time| format!("已断开 · 目录快照 {time}"))
+                .unwrap_or_else(|| "未读取 · 点击「读取远程目录」".into())
+                .into(),
+        );
     }
     ui.set_revision(ui.get_revision().wrapping_add(1));
 }
@@ -184,18 +202,61 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
 }
 
 fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
-    let (generation, tx) = {
+    let (generation, tx, remote_pane, remote_config, cancel) = {
         let mut state = state.borrow_mut();
+        if state.panes[side].remote && (state.busy || state.remote_worker.is_some()) {
+            return;
+        }
+        if state.panes[side].remote {
+            state.remote_cancel = Arc::new(AtomicBool::new(false));
+        }
         let pane = &mut state.panes[side];
         pane.generation += 1;
         pane.loading = true;
-        (pane.generation, state.tx.clone())
+        let generation = pane.generation;
+        let remote_pane = pane.remote;
+        (
+            generation,
+            state.tx.clone(),
+            remote_pane,
+            state.remote_config.clone(),
+            state.remote_cancel.clone(),
+        )
     };
+    if remote_pane {
+        ui.set_status("正在连接跳板机与家里 Windows…".into());
+        ui.set_remote_reading(true);
+    }
     paint_pane(ui, state, side);
-    thread::spawn(move || {
-        let result = files::read_directory(&path);
+    let worker = thread::spawn(move || {
+        let result = if remote_pane {
+            remote::read_directory(&remote_config, &path.to_string_lossy(), &cancel, |prompt| {
+                let (reply, answer) = mpsc::channel();
+                tx.send(Event::RemotePrompt(generation, prompt, reply))
+                    .map_err(|_| std::io::Error::other("界面已关闭"))?;
+                let deadline = Instant::now() + Duration::from_secs(120);
+                loop {
+                    if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "认证已取消或等待超过两分钟",
+                        ));
+                    }
+                    match answer.recv_timeout(Duration::from_millis(50)) {
+                        Ok(answer) => return Ok(answer),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(_) => return Ok(None),
+                    }
+                }
+            })
+        } else {
+            files::read_directory(&path)
+        };
         let _ = tx.send(Event::Directory(side, generation, result));
     });
+    if remote_pane {
+        state.borrow_mut().remote_worker = Some(worker);
+    }
 }
 
 fn selected(state: &State, side: usize) -> Vec<PathBuf> {
@@ -219,6 +280,10 @@ fn data_paths(data: &DataTransfer) -> Vec<PathBuf> {
 }
 
 fn start_copy(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: PathBuf) {
+    if state.borrow().panes.iter().any(|pane| pane.remote) {
+        set_remote_not_ready(ui);
+        return;
+    }
     if state.borrow().busy {
         return;
     }
@@ -249,13 +314,45 @@ fn start_copy(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: Pat
     }));
 }
 
+fn set_remote_not_ready(ui: &AppWindow) {
+    ui.set_status("远程文件传输尚未接入".into());
+    ui.set_detail("当前版本先实现远程目录读取；请勿对远程面板执行复制操作。".into());
+}
+
 fn wire(ui: &AppWindow, state: &Shared) {
+    let weak = ui.as_weak();
+    let shared = state.clone();
+    ui.on_auth_submit(move || {
+        let ui = weak.unwrap();
+        let answer = if ui.get_auth_host_key() {
+            Zeroizing::new("yes".into())
+        } else {
+            Zeroizing::new(ui.get_auth_secret().to_string())
+        };
+        ui.set_auth_secret("".into());
+        ui.set_auth_visible(false);
+        if let Some(reply) = shared.borrow_mut().auth_reply.take() {
+            let _ = reply.send(Some(answer));
+        }
+    });
+    let weak = ui.as_weak();
+    let shared = state.clone();
+    ui.on_auth_cancel(move || {
+        let ui = weak.unwrap();
+        ui.set_auth_secret("".into());
+        ui.set_auth_visible(false);
+        if let Some(reply) = shared.borrow_mut().auth_reply.take() {
+            let _ = reply.send(None);
+        }
+        shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
+    });
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_show_settings(move || {
         let ui = weak.unwrap();
         let config = shared.borrow().remote_config.clone();
         paint_remote_config(&ui, &config);
+        ui.set_settings_error("".into());
         ui.set_settings_visible(true);
     });
     let weak = ui.as_weak();
@@ -270,6 +367,9 @@ fn wire(ui: &AppWindow, state: &Shared) {
               windows_port,
               windows_user,
               windows_root| {
+            if shared.borrow().busy || shared.borrow().remote_worker.is_some() {
+                return;
+            }
             let config = RemoteConfig {
                 jump_host: jump_host.to_string(),
                 jump_port: jump_port.to_string(),
@@ -281,18 +381,35 @@ fn wire(ui: &AppWindow, state: &Shared) {
             };
             let ui = weak.unwrap();
             if let Err(error) = config.validate() {
+                ui.set_settings_error(error.clone().into());
                 ui.set_status("远程设置未保存".into());
                 ui.set_detail(error.into());
                 return;
             }
             match config.save() {
                 Ok(path) => {
-                    shared.borrow_mut().remote_config = config;
+                    let remote_root = PathBuf::from(&config.windows_root);
+                    {
+                        let mut state = shared.borrow_mut();
+                        state.remote_config = config;
+                        state.panes[1].remote = true;
+                        state.panes[1].path = remote_root.clone();
+                        state.panes[1].generation += 1;
+                        state.panes[1].loading = false;
+                        state.panes[1].entries.clear();
+                        state.panes[1].selected.clear();
+                        state.panes[1].snapshot_time = None;
+                        state.external = None;
+                    }
                     ui.set_settings_visible(false);
                     ui.set_status("远程设置已保存".into());
-                    ui.set_detail(format!("配置文件：{}；密码不会保存", path.display()).into());
+                    paint_pane(&ui, &shared, 1);
+                    ui.set_detail(
+                        format!("已保存到 {}；点击「读取远程目录」开始浏览", path.display()).into(),
+                    );
                 }
                 Err(error) => {
+                    ui.set_settings_error(error.to_string().into());
                     ui.set_status("远程设置未保存".into());
                     ui.set_detail(format!("写入配置失败：{error}").into());
                 }
@@ -306,7 +423,12 @@ fn wire(ui: &AppWindow, state: &Shared) {
         let ui = weak.unwrap();
         let side = side as usize;
         let mut path = PathBuf::from(path.as_str());
-        if path.is_relative() {
+        if shared.borrow().panes[side].remote {
+            path = remote::resolve_path(
+                &shared.borrow().panes[side].path.to_string_lossy(),
+                path.to_string_lossy().as_ref(),
+            );
+        } else if path.is_relative() {
             path = shared.borrow().panes[side].path.join(path);
         }
         navigate(&ui, &shared, side, path);
@@ -315,7 +437,14 @@ fn wire(ui: &AppWindow, state: &Shared) {
     let shared = state.clone();
     ui.on_parent_directory(move |side| {
         let side = side as usize;
-        let path = shared.borrow().panes[side].path.parent().map(PathBuf::from);
+        let path = {
+            let state = shared.borrow();
+            if state.panes[side].remote {
+                remote::parent_path(&state.panes[side].path.to_string_lossy())
+            } else {
+                state.panes[side].path.parent().map(PathBuf::from)
+            }
+        };
         if let Some(path) = path {
             navigate(&weak.unwrap(), &shared, side, path);
         }
@@ -381,6 +510,9 @@ fn wire(ui: &AppWindow, state: &Shared) {
     ui.on_make_payload(move |side, index, _revision| {
         let state = shared.borrow();
         let side = side as usize;
+        if state.panes.iter().any(|pane| pane.remote) {
+            return DataTransfer::default();
+        }
         let paths = match state.panes[side].entries.get(index as usize) {
             Some(entry) if state.panes[side].selected.contains(&entry.path) => {
                 selected(&state, side)
@@ -397,7 +529,11 @@ fn wire(ui: &AppWindow, state: &Shared) {
     let shared = state.clone();
     ui.on_accept_drop(move |side, event| {
         let state = shared.borrow();
-        if state.busy || state.panes[side as usize].loading || data_paths(&event.data).is_empty() {
+        if state.busy
+            || state.panes.iter().any(|pane| pane.remote)
+            || state.panes[side as usize].loading
+            || data_paths(&event.data).is_empty()
+        {
             DragAction::None
         } else {
             DragAction::Copy
@@ -406,12 +542,22 @@ fn wire(ui: &AppWindow, state: &Shared) {
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_receive_drop(move |side, event| {
+        if shared.borrow().panes[side as usize].remote {
+            set_remote_not_ready(&weak.unwrap());
+            return;
+        }
         let target = shared.borrow().panes[side as usize].path.clone();
         start_copy(&weak.unwrap(), &shared, data_paths(&event.data), target);
     });
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_copy_selected(move |side| {
+        if shared.borrow().panes[side as usize].remote
+            || shared.borrow().panes[1 - side as usize].remote
+        {
+            set_remote_not_ready(&weak.unwrap());
+            return;
+        }
         let (sources, target) = {
             let state = shared.borrow();
             (
@@ -425,6 +571,10 @@ fn wire(ui: &AppWindow, state: &Shared) {
     let shared = state.clone();
     ui.on_cancel(move || {
         shared.borrow().cancel.store(true, Ordering::Relaxed);
+        shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
+        shared.borrow_mut().auth_reply.take();
+        weak.unwrap().set_auth_secret("".into());
+        weak.unwrap().set_auth_visible(false);
         weak.unwrap()
             .set_status("正在取消，等待当前读写结束…".into());
     });
@@ -445,6 +595,13 @@ fn wire(ui: &AppWindow, state: &Shared) {
             }
             let side = side as usize;
             let mut state = shared.borrow_mut();
+            if state.panes.iter().any(|pane| pane.remote)
+                || ui.get_settings_visible()
+                || ui.get_auth_visible()
+            {
+                set_remote_not_ready(&ui);
+                return EventResult::PreventDefault;
+            }
             if state.busy || state.panes[side].loading {
                 return EventResult::PreventDefault;
             }
@@ -478,7 +635,42 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
             break;
         };
         match event {
+            Event::RemotePrompt(generation, prompt, reply) => {
+                let mut state = state.borrow_mut();
+                if generation != state.panes[1].generation
+                    || state.remote_cancel.load(Ordering::Relaxed)
+                {
+                    let _ = reply.send(None);
+                    continue;
+                }
+                let (title, detail, host_key) = match prompt {
+                    remote::Prompt::Secret { hop } => (format!("{hop} · SSH 认证"),
+                        "请输入该端 SSH 密码（或私钥口令）。仅用于本次读取，不保存；两分钟内未提交将断开。".to_string(), false),
+                    remote::Prompt::HostKey { hop, details } => (format!("{hop} · 确认主机指纹"),
+                        format!("{details}\n请通过可信方式核对指纹。确认后由 OpenSSH 记录至该端 known_hosts。"), true),
+                };
+                state.auth_reply = Some(reply);
+                ui.set_auth_title(title.into());
+                ui.set_auth_detail(detail.into());
+                ui.set_auth_host_key(host_key);
+                ui.set_auth_secret("".into());
+                ui.set_auth_visible(true);
+            }
             Event::Directory(side, generation, result) => {
+                if generation != state.borrow().panes[side].generation {
+                    continue;
+                }
+                let is_remote = state.borrow().panes[side].remote;
+                if is_remote {
+                    let worker = state.borrow_mut().remote_worker.take();
+                    if let Some(worker) = worker {
+                        let _ = worker.join();
+                    }
+                    state.borrow_mut().auth_reply.take();
+                    ui.set_remote_reading(false);
+                    ui.set_auth_visible(false);
+                    ui.set_auth_secret("".into());
+                }
                 {
                     let mut state = state.borrow_mut();
                     let pane = &mut state.panes[side];
@@ -491,8 +683,22 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                             pane.path = path;
                             pane.entries = entries;
                             pane.selected.clear();
+                            if is_remote {
+                                pane.snapshot_time = Some(
+                                    chrono::Utc::now()
+                                        .format("%Y-%m-%d %H:%M:%S UTC")
+                                        .to_string(),
+                                );
+                                ui.set_status("远程目录已更新，SSH 已断开".into());
+                                ui.set_history("右栏保留本次目录快照；双击目录、返回上级或刷新会重新连接认证。远程传输尚未接入。".into());
+                            }
                         }
-                        Err(error) => ui.set_history(format!("读取目录失败：{error}").into()),
+                        Err(error) => {
+                            ui.set_history(format!("读取目录失败：{error}").into());
+                            if is_remote {
+                                ui.set_status("远程读取未完成，SSH 已断开；保留上次快照".into());
+                            }
+                        }
                     }
                 }
                 paint_pane(ui, state, side);
@@ -589,23 +795,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .skip(1)
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    let (remote_config, load_error) = match RemoteConfig::load() {
+        Ok(config) => (config, None),
+        Err(error) => (RemoteConfig::default(), Some(error.to_string())),
+    };
+    let remote_enabled = remote_config.is_configured() && args.len() < 2;
     let paths = [
         args.first().cloned().unwrap_or_else(|| initial.clone()),
-        args.get(1).cloned().unwrap_or_else(|| initial.clone()),
+        if remote_enabled {
+            PathBuf::from(&remote_config.windows_root)
+        } else {
+            args.get(1).cloned().unwrap_or_else(|| initial.clone())
+        },
     ];
     let (tx, rx) = mpsc::channel();
     let state = Rc::new(RefCell::new(State {
         panes: [
             Pane {
                 path: initial.clone(),
+                remote: false,
                 ..Pane::default()
             },
             Pane {
-                path: initial,
+                path: if remote_enabled {
+                    PathBuf::from(&remote_config.windows_root)
+                } else {
+                    initial
+                },
+                remote: remote_enabled,
                 ..Pane::default()
             },
         ],
-        remote_config: RemoteConfig::load().unwrap_or_default(),
+        remote_config,
+        remote_cancel: Arc::new(AtomicBool::new(false)),
+        remote_worker: None,
+        auth_reply: None,
         tx,
         cancel: Arc::new(AtomicBool::new(false)),
         busy: false,
@@ -614,9 +838,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     ui.set_active_pane(1);
     paint_remote_config(&ui, &state.borrow().remote_config);
+    if let Some(error) = load_error {
+        ui.set_history(format!("读取配置失败，请检查「远程设置」：{error}").into());
+    }
     wire(&ui, &state);
     for (side, path) in paths.into_iter().enumerate() {
-        navigate(&ui, &state, side, path);
+        if state.borrow().panes[side].remote {
+            paint_pane(&ui, &state, side);
+        } else {
+            navigate(&ui, &state, side, path);
+        }
     }
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -629,11 +860,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared = state.clone();
     ui.window().on_close_requested(move || {
         shared.borrow().cancel.store(true, Ordering::Relaxed);
+        shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
+        shared.borrow_mut().auth_reply.take();
         slint::CloseRequestResponse::HideWindow
     });
     ui.run()?;
     state.borrow().cancel.store(true, Ordering::Relaxed);
+    state.borrow().remote_cancel.store(true, Ordering::Relaxed);
+    state.borrow_mut().auth_reply.take();
     if let Some(worker) = state.borrow_mut().worker.take() {
+        let _ = worker.join();
+    }
+    if let Some(worker) = state.borrow_mut().remote_worker.take() {
         let _ = worker.join();
     }
     Ok(())
@@ -698,14 +936,19 @@ mod ui_tests {
             panes: [
                 Pane {
                     path: left.clone(),
+                    remote: false,
                     ..Pane::default()
                 },
                 Pane {
                     path: right.clone(),
+                    remote: false,
                     ..Pane::default()
                 },
             ],
             remote_config: RemoteConfig::default(),
+            remote_cancel: Arc::new(AtomicBool::new(false)),
+            remote_worker: None,
+            auth_reply: None,
             tx,
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
@@ -773,6 +1016,137 @@ mod ui_tests {
         assert_eq!(data_paths(&native).len(), 2);
         assert_eq!(data_paths(&DataTransfer::default()).len(), 0);
         snapshot(&ui, "prototype-complete.png");
+
+        // Exercise remote UI events without connecting to any user host.
+        {
+            let mut state = state.borrow_mut();
+            state.panes[1].remote = true;
+            state.panes[1].generation += 1;
+            state.remote_config = RemoteConfig {
+                jump_host: "bastion.example.com".into(),
+                jump_port: "22".into(),
+                jump_user: "jump-user".into(),
+                windows_host: "100.64.0.2".into(),
+                windows_port: "22".into(),
+                windows_user: "home-user".into(),
+                windows_root: "C:/Users/home".into(),
+            };
+        }
+        paint_remote_config(&ui, &state.borrow().remote_config);
+        let generation = state.borrow().panes[1].generation;
+        let entries = vec![files::Entry {
+            name: "远程资料".into(),
+            path: PathBuf::from("C:/Users/home/远程资料"),
+            directory: true,
+            link: false,
+            size: 0,
+            modified: "2026-10-21 10:00 UTC".into(),
+        }];
+        state
+            .borrow()
+            .tx
+            .send(Event::Directory(
+                1,
+                generation,
+                Ok((PathBuf::from("C:/Users/home"), entries)),
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        assert!(ui.get_right_remote());
+        assert_eq!(ui.get_right_rows().row_count(), 1);
+        assert!(ui.get_remote_snapshot().contains("已断开"));
+        snapshot(&ui, "remote-browser.png");
+        ui.invoke_copy_selected(1);
+        assert!(!state.borrow().busy);
+        assert!(ui.get_status().contains("尚未接入"));
+        assert!(data_paths(&ui.invoke_make_payload(1, 0, ui.get_revision())).is_empty());
+        state
+            .borrow()
+            .tx
+            .send(Event::Directory(
+                1,
+                generation - 1,
+                Ok((right.clone(), Vec::new())),
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        assert_eq!(state.borrow().panes[1].path, PathBuf::from("C:/Users/home"));
+        state
+            .borrow()
+            .tx
+            .send(Event::Directory(
+                1,
+                generation,
+                Err(std::io::Error::other("模拟认证失败")),
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        assert_eq!(
+            ui.get_right_rows().row_count(),
+            1,
+            "keep last snapshot on error"
+        );
+        snapshot(&ui, "remote-error.png");
+
+        let (reply, answer) = mpsc::channel();
+        state
+            .borrow()
+            .tx
+            .send(Event::RemotePrompt(
+                generation,
+                remote::Prompt::HostKey {
+                    hop: "跳板机",
+                    details: "ED25519 key fingerprint is SHA256:example.\n请核对主机指纹。".into(),
+                },
+                reply,
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        assert!(ui.get_auth_visible() && ui.get_auth_host_key());
+        snapshot(&ui, "remote-host-key.png");
+        ui.invoke_auth_submit();
+        assert_eq!(answer.recv().unwrap().unwrap().as_str(), "yes");
+
+        let (reply, answer) = mpsc::channel();
+        state
+            .borrow()
+            .tx
+            .send(Event::RemotePrompt(
+                generation,
+                remote::Prompt::Secret {
+                    hop: "家里 Windows",
+                },
+                reply,
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        ui.set_auth_secret("ui-test-secret".into());
+        snapshot(&ui, "remote-auth.png");
+        ui.invoke_auth_submit();
+        assert_eq!(answer.recv().unwrap().unwrap().as_str(), "ui-test-secret");
+        assert!(ui.get_auth_secret().is_empty());
+        assert!(!ui.get_history().contains("ui-test-secret"));
+
+        let (reply, answer) = mpsc::channel();
+        state
+            .borrow()
+            .tx
+            .send(Event::RemotePrompt(
+                generation,
+                remote::Prompt::Secret { hop: "跳板机" },
+                reply,
+            ))
+            .unwrap();
+        poll(&ui, &state, &rx);
+        ui.invoke_auth_cancel();
+        assert!(answer.recv().unwrap().is_none());
+        assert!(state.borrow().remote_cancel.load(Ordering::Relaxed));
+        ui.invoke_show_settings();
+        ui.set_setting_jump_host("bastion.example.com".into());
+        ui.set_setting_windows_host("100.64.0.2".into());
+        ui.set_setting_windows_root("C:/Users/home".into());
+        snapshot(&ui, "remote-settings.png");
+        ui.invoke_cancel_settings();
         ui.hide().unwrap();
     }
 }
