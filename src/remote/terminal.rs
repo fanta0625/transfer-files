@@ -13,7 +13,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const OPTIONS: &[&str] = &[
+pub(crate) const OPTIONS: &[&str] = &[
     "-o",
     "ConnectTimeout=10",
     "-o",
@@ -49,7 +49,7 @@ const OPTIONS: &[&str] = &[
 ];
 const LIMIT: usize = 16 * 1024 * 1024;
 
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -105,7 +105,7 @@ pub fn read_directory(
             .unwrap_or_default()
             .as_nanos()
     );
-    let output = run(
+    let output = run_command(
         command(config, path, &token),
         &token,
         cancel,
@@ -123,7 +123,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn run(
+pub fn run_command(
     cmd: CommandBuilder,
     token: &str,
     cancel: &AtomicBool,
@@ -397,7 +397,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
         let mut cmd = CommandBuilder::new("python3");
         cmd.args(["-c", program]);
         let mut hops = Vec::new();
-        let output = run(
+        let output = run_command(
             cmd,
             "test",
             &AtomicBool::new(false),
@@ -432,7 +432,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
         ]);
         let started = Instant::now();
         assert!(
-            run(
+            run_command(
                 cmd.clone(),
                 "test",
                 &AtomicBool::new(false),
@@ -442,7 +442,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
             .is_err()
         );
         assert!(
-            run(
+            run_command(
                 cmd,
                 "test",
                 &AtomicBool::new(false),

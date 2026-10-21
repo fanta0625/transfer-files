@@ -25,7 +25,7 @@
 - `loongarch64-unknown-linux-gnu`：`cargo check --locked --offline --target loongarch64-unknown-linux-gnu` 通过。交叉检查使用 Rust 1.99.1 和目标标准库，允许 pkg-config 使用主机库元数据；它不包含龙芯目标链接或实机运行验证，也不等于验证过目标机 Rust 1.95 的完整构建。
 - 无窗口软件渲染截图已检查：本地复制、远程快照、失败保留旧目录、主机指纹、密码弹窗和设置窗口。远程截图使用注入的模拟目录，不是实际 SSH 结果。
 - 原生 X11 / Dolphin 拖入代码已接入，仍需在用户的 LoongArch64 / KDE X11 桌面实测。
-- 已实现两段 SSH 的远程只读目录浏览；尚未在用户的真实跳板机、Windows 和 LoongArch64 客户端上联调。远程传输和 GUI 拖出到 Dolphin 未实现。
+- 已实现两段 SSH 的远程目录浏览与文件/目录传输；尚未在用户的真实跳板机、Windows 和 LoongArch64 客户端上联调。GUI 拖出到 Dolphin 未实现。
 
 ## 运行准备
 

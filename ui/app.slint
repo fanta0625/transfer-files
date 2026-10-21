@@ -196,7 +196,7 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 12px;
             left-pane := FilePane {
-                transfer-enabled: !root.right-remote;
+                transfer-enabled: true;
                 heading: "左侧文件"; subtitle: "当前电脑 · 本地目录"; remote: false;
                 path: root.left-path; rows: root.left-rows;
                 summary: root.left-summary; loading: root.left-loading;
@@ -235,8 +235,8 @@ export component AppWindow inherits Window {
         }
         HorizontalLayout {
             spacing: 10px;
-            Button { text: "左侧选中 → 右侧"; enabled: !root.right-remote && !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(0); } }
-            Button { text: "左侧 ← 右侧选中"; enabled: !root.right-remote && !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(1); } }
+            Button { text: root.right-remote ? "左侧选中 → 远程" : "左侧选中 → 右侧"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(0); } }
+            Button { text: root.right-remote ? "远程选中 → 左侧" : "左侧 ← 右侧选中"; enabled: !root.busy && !root.left-loading && !root.right-loading; clicked => { root.copy-selected(1); } }
             Rectangle { horizontal-stretch: 1; }
             Button { text: root.remote-reading ? "取消远程读取" : "取消当前批次"; enabled: root.busy || root.remote-reading; clicked => { root.cancel(); } }
         }

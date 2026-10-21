@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 mod protocol;
 #[cfg(target_os = "linux")]
 mod terminal;
+#[cfg(target_os = "linux")]
+pub mod transfer;
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub enum Prompt {
@@ -16,6 +18,44 @@ pub enum Prompt {
 
 pub type Answer = Option<Zeroizing<String>>;
 pub type Listing = (PathBuf, Vec<Entry>);
+
+#[derive(Default)]
+pub struct CredentialCache {
+    pub jump: Option<Zeroizing<String>>,
+    pub windows: Option<Zeroizing<String>>,
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl CredentialCache {
+    pub fn clear(&mut self) {
+        self.jump = None;
+        self.windows = None;
+        self.expires_at = None;
+    }
+    pub fn valid(&self) -> bool {
+        self.expires_at
+            .is_some_and(|t| t > std::time::Instant::now())
+    }
+    pub fn get(&mut self, hop: &str) -> Option<Zeroizing<String>> {
+        if !self.valid() {
+            self.clear();
+            return None;
+        }
+        match hop {
+            "跳板机" => self.jump.clone(),
+            "家里 Windows" => self.windows.clone(),
+            _ => None,
+        }
+    }
+    pub fn put(&mut self, hop: &str, value: Zeroizing<String>) {
+        match hop {
+            "跳板机" => self.jump = Some(value),
+            "家里 Windows" => self.windows = Some(value),
+            _ => return,
+        }
+        self.expires_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
+    }
+}
 
 pub fn read_directory(
     config: &RemoteConfig,

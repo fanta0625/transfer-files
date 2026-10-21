@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
@@ -40,6 +40,8 @@ enum Event {
     RemotePrompt(u64, remote::Prompt, Sender<remote::Answer>),
     Progress(files::Progress),
     Finished(files::Report),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    RemoteTransferFinished(u64, Result<String, String>),
 }
 
 struct State {
@@ -48,6 +50,7 @@ struct State {
     remote_cancel: Arc<AtomicBool>,
     remote_worker: Option<thread::JoinHandle<()>>,
     auth_reply: Option<Sender<remote::Answer>>,
+    credentials: Arc<Mutex<remote::CredentialCache>>,
     tx: Sender<Event>,
     cancel: Arc<AtomicBool>,
     busy: bool,
@@ -201,6 +204,46 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
     ui.set_setting_windows_root(config.windows_root.clone().into());
 }
 
+fn ask_remote(
+    tx: &Sender<Event>,
+    generation: u64,
+    cancel: &AtomicBool,
+    cache: &Arc<Mutex<remote::CredentialCache>>,
+    prompt: remote::Prompt,
+) -> std::io::Result<remote::Answer> {
+    let hop = match &prompt {
+        remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => *hop,
+    };
+    if matches!(prompt, remote::Prompt::Secret { .. })
+        && let Some(answer) = cache.lock().unwrap().get(hop)
+    {
+        return Ok(Some(answer));
+    }
+    let (reply, answer) = mpsc::channel();
+    tx.send(Event::RemotePrompt(generation, prompt, reply))
+        .map_err(|_| std::io::Error::other("界面已关闭"))?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "认证已取消或等待超过两分钟",
+            ));
+        }
+        match answer.recv_timeout(Duration::from_millis(50)) {
+            Ok(Some(value)) => {
+                if hop == "跳板机" || hop == "家里 Windows" {
+                    cache.lock().unwrap().put(hop, value.clone());
+                }
+                return Ok(Some(value));
+            }
+            Ok(None) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
 fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
     let (generation, tx, remote_pane, remote_config, cancel) = {
         let mut state = state.borrow_mut();
@@ -223,6 +266,7 @@ fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
             state.remote_cancel.clone(),
         )
     };
+    let credentials = state.borrow().credentials.clone();
     if remote_pane {
         ui.set_status("正在连接跳板机与家里 Windows…".into());
         ui.set_remote_reading(true);
@@ -231,23 +275,7 @@ fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
     let worker = thread::spawn(move || {
         let result = if remote_pane {
             remote::read_directory(&remote_config, &path.to_string_lossy(), &cancel, |prompt| {
-                let (reply, answer) = mpsc::channel();
-                tx.send(Event::RemotePrompt(generation, prompt, reply))
-                    .map_err(|_| std::io::Error::other("界面已关闭"))?;
-                let deadline = Instant::now() + Duration::from_secs(120);
-                loop {
-                    if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "认证已取消或等待超过两分钟",
-                        ));
-                    }
-                    match answer.recv_timeout(Duration::from_millis(50)) {
-                        Ok(answer) => return Ok(answer),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(_) => return Ok(None),
-                    }
-                }
+                ask_remote(&tx, generation, &cancel, &credentials, prompt)
             })
         } else {
             files::read_directory(&path)
@@ -280,8 +308,8 @@ fn data_paths(data: &DataTransfer) -> Vec<PathBuf> {
 }
 
 fn start_copy(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: PathBuf) {
-    if state.borrow().panes.iter().any(|pane| pane.remote) {
-        set_remote_not_ready(ui);
+    if state.borrow().panes[1].remote {
+        start_remote_upload(ui, state, sources, target);
         return;
     }
     if state.borrow().busy {
@@ -314,9 +342,121 @@ fn start_copy(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: Pat
     }));
 }
 
+#[cfg(target_os = "linux")]
+fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: PathBuf) {
+    if sources.is_empty() || state.borrow().busy || state.borrow().remote_worker.is_some() {
+        if sources.is_empty() {
+            ui.set_status("请先选择要下载的文件或目录".into());
+        }
+        return;
+    }
+    let (generation, tx, config, cancel, credentials) = {
+        let mut state = state.borrow_mut();
+        state.remote_cancel = Arc::new(AtomicBool::new(false));
+        state.panes[1].generation += 1;
+        state.panes[1].loading = true;
+        state.busy = true;
+        (
+            state.panes[1].generation,
+            state.tx.clone(),
+            state.remote_config.clone(),
+            state.remote_cancel.clone(),
+            state.credentials.clone(),
+        )
+    };
+    ui.set_busy(true);
+    ui.set_remote_reading(true);
+    ui.set_progress(0.0);
+    ui.set_status(format!("正在下载 {} 个项目…", sources.len()).into());
+    let worker = thread::spawn(move || {
+        let result = (|| {
+            for (index, source) in sources.iter().enumerate() {
+                let name = source
+                    .file_name()
+                    .ok_or_else(|| "远程路径没有文件名".to_string())?
+                    .to_string_lossy()
+                    .to_string();
+                remote::transfer::download(
+                    &config,
+                    &source.to_string_lossy(),
+                    &name,
+                    &target,
+                    &cancel,
+                    |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
+                )
+                .map_err(|e| e.to_string())?;
+                let _ = tx.send(Event::Progress(files::Progress {
+                    files: index + 1,
+                    total_files: sources.len(),
+                    current: name,
+                    ..Default::default()
+                }));
+            }
+            Ok("下载完成，SSH 已断开".into())
+        })();
+        let _ = tx.send(Event::RemoteTransferFinished(generation, result));
+    });
+    state.borrow_mut().remote_worker = Some(worker);
+}
+
+#[cfg(target_os = "linux")]
+fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: PathBuf) {
+    if sources.is_empty() || state.borrow().busy || state.borrow().remote_worker.is_some() {
+        if sources.is_empty() {
+            ui.set_status("请先选择要上传的文件或目录".into());
+        }
+        return;
+    }
+    let (generation, tx, config, cancel, credentials) = {
+        let mut state = state.borrow_mut();
+        state.remote_cancel = Arc::new(AtomicBool::new(false));
+        state.panes[1].generation += 1;
+        state.panes[1].loading = true;
+        state.busy = true;
+        (
+            state.panes[1].generation,
+            state.tx.clone(),
+            state.remote_config.clone(),
+            state.remote_cancel.clone(),
+            state.credentials.clone(),
+        )
+    };
+    ui.set_busy(true);
+    ui.set_remote_reading(true);
+    ui.set_progress(0.0);
+    ui.set_status(format!("正在上传 {} 个项目…", sources.len()).into());
+    ui.set_detail(format!("目标：{}；密码缓存 5 分钟", target.display()).into());
+    let worker = thread::spawn(move || {
+        let result = (|| {
+            for (index, source) in sources.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("上传已取消，SSH 已断开".into());
+                }
+                remote::transfer::upload(
+                    &config,
+                    source,
+                    &target.to_string_lossy(),
+                    &cancel,
+                    |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
+                )
+                .map_err(|e| e.to_string())?;
+                let _ = tx.send(Event::Progress(files::Progress {
+                    files: index + 1,
+                    total_files: sources.len(),
+                    current: source.display().to_string(),
+                    ..Default::default()
+                }));
+            }
+            Ok("上传完成，SSH 已断开".into())
+        })();
+        let _ = tx.send(Event::RemoteTransferFinished(generation, result));
+    });
+    state.borrow_mut().remote_worker = Some(worker);
+}
+
 fn set_remote_not_ready(ui: &AppWindow) {
-    ui.set_status("远程文件传输尚未接入".into());
-    ui.set_detail("当前版本先实现远程目录读取；请勿对远程面板执行复制操作。".into());
+    ui.set_status("当前操作不可用".into());
+    ui.set_detail("远程面板支持从左侧上传、从右侧下载；请先选择文件或目录。".into());
 }
 
 fn wire(ui: &AppWindow, state: &Shared) {
@@ -510,7 +650,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
     ui.on_make_payload(move |side, index, _revision| {
         let state = shared.borrow();
         let side = side as usize;
-        if state.panes.iter().any(|pane| pane.remote) {
+        if state.panes[side].remote {
             return DataTransfer::default();
         }
         let paths = match state.panes[side].entries.get(index as usize) {
@@ -530,7 +670,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
     ui.on_accept_drop(move |side, event| {
         let state = shared.borrow();
         if state.busy
-            || state.panes.iter().any(|pane| pane.remote)
+            || state.panes[side as usize].remote && data_paths(&event.data).is_empty()
             || state.panes[side as usize].loading
             || data_paths(&event.data).is_empty()
         {
@@ -542,19 +682,22 @@ fn wire(ui: &AppWindow, state: &Shared) {
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_receive_drop(move |side, event| {
-        if shared.borrow().panes[side as usize].remote {
-            set_remote_not_ready(&weak.unwrap());
-            return;
-        }
         let target = shared.borrow().panes[side as usize].path.clone();
         start_copy(&weak.unwrap(), &shared, data_paths(&event.data), target);
     });
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_copy_selected(move |side| {
-        if shared.borrow().panes[side as usize].remote
-            || shared.borrow().panes[1 - side as usize].remote
-        {
+        if shared.borrow().panes[side as usize].remote {
+            let (sources, target) = {
+                let state = shared.borrow();
+                (selected(&state, side as usize), state.panes[0].path.clone())
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = (&sources, &target);
+            #[cfg(target_os = "linux")]
+            start_remote_download(&weak.unwrap(), &shared, sources, target);
+            #[cfg(not(target_os = "linux"))]
             set_remote_not_ready(&weak.unwrap());
             return;
         }
@@ -573,6 +716,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
         shared.borrow().cancel.store(true, Ordering::Relaxed);
         shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
         shared.borrow_mut().auth_reply.take();
+        shared.borrow().credentials.lock().unwrap().clear();
         weak.unwrap().set_auth_secret("".into());
         weak.unwrap().set_auth_visible(false);
         weak.unwrap()
@@ -595,7 +739,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
             }
             let side = side as usize;
             let mut state = shared.borrow_mut();
-            if state.panes.iter().any(|pane| pane.remote)
+            if (state.panes[side].remote && side != 1)
                 || ui.get_settings_visible()
                 || ui.get_auth_visible()
             {
@@ -764,6 +908,38 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                     navigate(ui, state, side, path);
                 }
             }
+            Event::RemoteTransferFinished(generation, result) => {
+                if generation != state.borrow().panes[1].generation {
+                    continue;
+                }
+                let worker = state.borrow_mut().remote_worker.take();
+                if let Some(worker) = worker {
+                    let _ = worker.join();
+                }
+                {
+                    let mut state = state.borrow_mut();
+                    state.busy = false;
+                    state.panes[1].loading = false;
+                    state.auth_reply.take();
+                }
+                ui.set_busy(false);
+                ui.set_remote_reading(false);
+                ui.set_auth_visible(false);
+                ui.set_auth_secret("".into());
+                match result {
+                    Ok(message) => {
+                        ui.set_progress(1.0);
+                        ui.set_status(message.into());
+                        ui.set_detail("远程目录上传完成；密码缓存仍会在 5 分钟后过期。".into());
+                        ui.set_history("目录使用 scp -r 递归上传；本次 SSH 会话已关闭。".into());
+                    }
+                    Err(error) => {
+                        ui.set_status("远程上传失败，SSH 已断开".into());
+                        ui.set_detail(error.into());
+                    }
+                }
+                paint_pane(ui, state, 1);
+            }
         }
     }
     let external = {
@@ -782,6 +958,11 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
     if let Some((_, target, sources)) = external {
         start_copy(ui, state, sources, target);
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_remote_upload(ui: &AppWindow, _state: &Shared, _sources: Vec<PathBuf>, _target: PathBuf) {
+    set_remote_not_ready(ui);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -830,6 +1011,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         remote_cancel: Arc::new(AtomicBool::new(false)),
         remote_worker: None,
         auth_reply: None,
+        credentials: Arc::new(Mutex::new(remote::CredentialCache::default())),
         tx,
         cancel: Arc::new(AtomicBool::new(false)),
         busy: false,
@@ -949,6 +1131,7 @@ mod ui_tests {
             remote_cancel: Arc::new(AtomicBool::new(false)),
             remote_worker: None,
             auth_reply: None,
+            credentials: Arc::new(Mutex::new(remote::CredentialCache::default())),
             tx,
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
@@ -1056,9 +1239,9 @@ mod ui_tests {
         assert_eq!(ui.get_right_rows().row_count(), 1);
         assert!(ui.get_remote_snapshot().contains("已断开"));
         snapshot(&ui, "remote-browser.png");
-        ui.invoke_copy_selected(1);
+        // Remote copies are exercised against a real configured host only; this
+        // UI test verifies that no remote path is exposed as a local payload.
         assert!(!state.borrow().busy);
-        assert!(ui.get_status().contains("尚未接入"));
         assert!(data_paths(&ui.invoke_make_payload(1, 0, ui.get_revision())).is_empty());
         state
             .borrow()
