@@ -2,7 +2,7 @@
 
 Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 跳板机 → 家里 Windows”的两段传输客户端验证交互。
 
-**当前两栏都操作运行程序的电脑上的真实本地文件。尚未接入 SSH、密码认证或远端 Windows，因此当前版本没有“远程设置”入口。**
+**当前两栏都操作运行程序的电脑上的真实本地文件。尚未接入 SSH、密码认证或远端 Windows；“远程设置”目前只保存连接参数。**
 
 ![双栏原型界面](docs/images/prototype.png)
 
@@ -16,6 +16,7 @@ Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 
 - 从 Dolphin 拖入文件、多个文件、目录，作为一个批次复制。
 - 后台扫描及复制、字节进度、错误日志、取消。
 - 同名目标跳过，源文件保留；目录同名整体跳过，不合并。
+- “远程设置”窗口可保存跳板机与 Windows 的连接参数；密码不会保存。
 
 ## 在龙芯 Linux 上运行
 
@@ -43,6 +44,8 @@ bash scripts/run.sh
 ```
 
 如果希望从 KDE 应用菜单启动，可以把 `scripts/run.sh` 添加为桌面快捷方式；脚本所在的项目目录需要保留不变。源代码更新后重新执行一次 `cargo build --release --locked` 即可。
+
+启动后点击右上角“远程设置”，填写跳板机地址、端口、用户名，以及家里 Windows 的 Tailscale 地址、SSH 端口、用户名和默认目录。当前版本只保存这些参数并显示保存位置，不会发起连接；密码也不会写入磁盘。Linux 默认保存到 `~/.config/transfer-files/config.conf`。
 
 两栏默认打开当前目录。可指定不同的初始目录，路径含空格时加引号：
 
@@ -108,6 +111,7 @@ cargo test --locked
 
 ```text
 src/main.rs                     界面控制、目录工作线程、拖放适配、批次进度
+src/config.rs                   远程连接参数的加载、校验和保存（不含密码）
 src/files.rs                    本地目录读取与可取消的复制引擎
 ui/app.slint                    双栏界面
 docs/development-requirements.md 完整需求与后续 SSH 方案

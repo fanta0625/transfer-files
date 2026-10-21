@@ -1,3 +1,4 @@
+mod config;
 mod files;
 
 use slint::{
@@ -16,6 +17,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+use config::RemoteConfig;
 
 slint::include_modules!();
 
@@ -36,6 +39,7 @@ enum Event {
 
 struct State {
     panes: [Pane; 2],
+    remote_config: RemoteConfig,
     tx: Sender<Event>,
     cancel: Arc<AtomicBool>,
     busy: bool,
@@ -169,6 +173,16 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
     ui.set_revision(ui.get_revision().wrapping_add(1));
 }
 
+fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
+    ui.set_setting_jump_host(config.jump_host.clone().into());
+    ui.set_setting_jump_port(config.jump_port.clone().into());
+    ui.set_setting_jump_user(config.jump_user.clone().into());
+    ui.set_setting_windows_host(config.windows_host.clone().into());
+    ui.set_setting_windows_port(config.windows_port.clone().into());
+    ui.set_setting_windows_user(config.windows_user.clone().into());
+    ui.set_setting_windows_root(config.windows_root.clone().into());
+}
+
 fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
     let (generation, tx) = {
         let mut state = state.borrow_mut();
@@ -236,6 +250,56 @@ fn start_copy(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, target: Pat
 }
 
 fn wire(ui: &AppWindow, state: &Shared) {
+    let weak = ui.as_weak();
+    let shared = state.clone();
+    ui.on_show_settings(move || {
+        let ui = weak.unwrap();
+        let config = shared.borrow().remote_config.clone();
+        paint_remote_config(&ui, &config);
+        ui.set_settings_visible(true);
+    });
+    let weak = ui.as_weak();
+    ui.on_cancel_settings(move || weak.unwrap().set_settings_visible(false));
+    let weak = ui.as_weak();
+    let shared = state.clone();
+    ui.on_save_settings(
+        move |jump_host,
+              jump_port,
+              jump_user,
+              windows_host,
+              windows_port,
+              windows_user,
+              windows_root| {
+            let config = RemoteConfig {
+                jump_host: jump_host.to_string(),
+                jump_port: jump_port.to_string(),
+                jump_user: jump_user.to_string(),
+                windows_host: windows_host.to_string(),
+                windows_port: windows_port.to_string(),
+                windows_user: windows_user.to_string(),
+                windows_root: windows_root.to_string(),
+            };
+            let ui = weak.unwrap();
+            if let Err(error) = config.validate() {
+                ui.set_status("远程设置未保存".into());
+                ui.set_detail(error.into());
+                return;
+            }
+            match config.save() {
+                Ok(path) => {
+                    shared.borrow_mut().remote_config = config;
+                    ui.set_settings_visible(false);
+                    ui.set_status("远程设置已保存".into());
+                    ui.set_detail(format!("配置文件：{}；密码不会保存", path.display()).into());
+                }
+                Err(error) => {
+                    ui.set_status("远程设置未保存".into());
+                    ui.set_detail(format!("写入配置失败：{error}").into());
+                }
+            }
+        },
+    );
+
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_navigate(move |side, path| {
@@ -541,6 +605,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Pane::default()
             },
         ],
+        remote_config: RemoteConfig::load().unwrap_or_default(),
         tx,
         cancel: Arc::new(AtomicBool::new(false)),
         busy: false,
@@ -548,6 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         external: None,
     }));
     ui.set_active_pane(1);
+    paint_remote_config(&ui, &state.borrow().remote_config);
     wire(&ui, &state);
     for (side, path) in paths.into_iter().enumerate() {
         navigate(&ui, &state, side, path);
@@ -639,6 +705,7 @@ mod ui_tests {
                     ..Pane::default()
                 },
             ],
+            remote_config: RemoteConfig::default(),
             tx,
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,

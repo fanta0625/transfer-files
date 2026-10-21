@@ -115,7 +115,7 @@ component FilePane inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "Transfer Files · 本地双栏原型";
+    title: "Transfer Files · 双栏文件传输";
     preferred-width: 1180px;
     preferred-height: 800px;
     min-width: 920px;
@@ -136,6 +136,14 @@ export component AppWindow inherits Window {
     in property <string> status: "准备就绪";
     in property <string> detail;
     in property <string> history;
+    in-out property <string> setting-jump-host;
+    in-out property <string> setting-jump-port;
+    in-out property <string> setting-jump-user;
+    in-out property <string> setting-windows-host;
+    in-out property <string> setting-windows-port;
+    in-out property <string> setting-windows-user;
+    in-out property <string> setting-windows-root;
+    in property <bool> settings-visible;
     callback navigate(int, string);
     callback parent-directory(int);
     callback refresh(int);
@@ -149,6 +157,9 @@ export component AppWindow inherits Window {
     callback receive-drop(int, DropEvent);
     callback copy-selected(int);
     callback cancel();
+    callback show-settings();
+    callback save-settings(string, string, string, string, string, string, string);
+    callback cancel-settings();
 
     // Used by the X11 native file-drop adapter; coordinates are logical pixels.
     public pure function pane-at(x: float, y: float) -> int {
@@ -164,7 +175,8 @@ export component AppWindow inherits Window {
         spacing: 12px;
         HorizontalLayout {
             Text { text: "TRANSFER FILES"; color: #173b3d; font-size: 23px; font-weight: 800; }
-            Text { text: "本地验证 / 两栏都访问当前电脑"; color: #667782; horizontal-alignment: right; }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "远程设置"; enabled: !root.busy; clicked => { root.show-settings(); } }
         }
         Text { text: "勾选文件后拖到另一栏，或使用复制按钮。同名目标跳过，源文件始终保留。"; color: #526570; font-size: 13px; }
         HorizontalLayout {
@@ -222,6 +234,84 @@ export component AppWindow inherits Window {
                 ProgressIndicator { progress: root.progress; }
                 Text { text: root.detail; color: #526570; font-size: 12px; overflow: elide; }
                 TextEdit { text: root.history; read-only: true; font-size: 11px; }
+            }
+        }
+    }
+
+    if root.settings-visible : Rectangle {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        background: #00000055;
+        Rectangle {
+            x: (root.width - 620px) / 2;
+            y: (root.height - 580px) / 2;
+            width: 620px; height: 580px;
+            background: #ffffff;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #c7d4d8;
+            VerticalLayout {
+                padding: 22px;
+                spacing: 10px;
+                Text { text: "远程连接设置"; color: #173b3d; font-size: 21px; font-weight: 700; }
+                Text {
+                    text: "保存主机、端口、用户名和默认目录。密码不会写入配置文件，实际连接时再输入。";
+                    color: #526570; font-size: 12px; wrap: word-wrap;
+                }
+                Text { text: "SSH 跳板机"; color: #178477; font-size: 14px; font-weight: 700; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "地址"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-jump-host; placeholder-text: "例如 bastion.example.com"; }
+                    Text { text: "端口"; width: 45px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-jump-port; width: 80px; placeholder-text: "22"; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "用户名"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-jump-user; placeholder-text: "跳板机 SSH 用户"; }
+                }
+                Text { text: "家里 Windows SSH"; color: #178477; font-size: 14px; font-weight: 700; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Tailscale 地址"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-windows-host; placeholder-text: "例如 100.64.0.2"; }
+                    Text { text: "端口"; width: 45px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-windows-port; width: 80px; placeholder-text: "22"; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "用户名"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-windows-user; placeholder-text: "Windows OpenSSH 用户"; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "默认目录"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-windows-root; placeholder-text: "例如 C:/Users/你的用户名"; }
+                }
+                Text {
+                    text: "当前阶段只保存连接参数；点击保存不会发起连接。SSH 目录读取和两段传输将在下一阶段接入。";
+                    color: #8a5a20; font-size: 12px; wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "取消"; clicked => { root.cancel-settings(); } }
+                    Button {
+                        text: "保存设置";
+                        clicked => {
+                            root.save-settings(
+                                root.setting-jump-host,
+                                root.setting-jump-port,
+                                root.setting-jump-user,
+                                root.setting-windows-host,
+                                root.setting-windows-port,
+                                root.setting-windows-user,
+                                root.setting-windows-root
+                            );
+                        }
+                    }
+                }
             }
         }
     }
