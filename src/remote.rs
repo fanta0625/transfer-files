@@ -19,6 +19,19 @@ pub enum Prompt {
 pub type Answer = Option<Zeroizing<String>>;
 pub type Listing = (PathBuf, Vec<Entry>);
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub fn file_name(path: &str) -> io::Result<String> {
+    // Path::file_name on Linux does not recognize Windows backslashes.
+    let normalized = path.replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or_default();
+    if name.is_empty() || name == "." || name == ".." || name.contains(':') {
+        return Err(io::Error::other(
+            "请选择远程文件或子目录，不能传输盘符根目录",
+        ));
+    }
+    Ok(name.to_string())
+}
+
 #[derive(Default)]
 pub struct CredentialCache {
     pub jump: Option<Zeroizing<String>>,
@@ -123,6 +136,13 @@ pub fn parent_path(path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_file_name_uses_windows_separators_on_every_platform() {
+        assert_eq!(file_name(r"C:\Users\home\资料.txt").unwrap(), "资料.txt");
+        assert_eq!(file_name("C:/Users/home/资料").unwrap(), "资料");
+        assert!(file_name("C:/").is_err());
+        assert!(file_name("C:").is_err());
+    }
     #[test]
     fn windows_navigation_preserves_drive_and_unc_roots() {
         assert_eq!(parent_path(r"C:\Users"), Some(PathBuf::from("C:/")));

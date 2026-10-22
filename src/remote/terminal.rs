@@ -304,7 +304,13 @@ fn ssh_error(output: &str, hop: &str) -> String {
     {
         "主机密钥校验失败；请先核实该端 known_hosts 中的密钥"
     } else if lower.contains("permission denied") {
-        "认证失败；请检查该端用户名和密码"
+        "认证或文件权限不足；检查用户名、密码和源/目标目录权限"
+    } else if lower.contains("no such file") || lower.contains("cannot stat") {
+        "文件或目录不存在；刷新目录并检查路径"
+    } else if lower.contains("no space left") {
+        "磁盘空间不足；检查跳板机和目标磁盘"
+    } else if lower.contains("subsystem request failed") {
+        "SFTP 子系统不可用；检查该端 OpenSSH 的 SFTP 配置"
     } else if lower.contains("could not resolve hostname") {
         "无法解析主机名"
     } else if lower.contains("connection refused") {
@@ -312,9 +318,9 @@ fn ssh_error(output: &str, hop: &str) -> String {
     } else if lower.contains("timed out") || lower.contains("no route to host") {
         "网络不可达或连接超时"
     } else if lower.contains("not found") || lower.contains("not recognized") {
-        "找不到 ssh 或 powershell.exe；检查跳板机 OpenSSH 和 Windows PowerShell"
+        "找不到 ssh、scp 或 powershell.exe；检查跳板机 OpenSSH 和 Windows PowerShell"
     } else {
-        "SSH 命令失败；检查网络、认证、主机密钥与 PowerShell"
+        "SSH/SCP 命令失败；检查网络、认证、SFTP 服务与文件路径"
     };
     format!("{hop}：{reason}；连接已关闭")
 }

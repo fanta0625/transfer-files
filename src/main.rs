@@ -211,12 +211,11 @@ fn ask_remote(
     cache: &Arc<Mutex<remote::CredentialCache>>,
     prompt: remote::Prompt,
 ) -> std::io::Result<remote::Answer> {
+    let is_secret = matches!(prompt, remote::Prompt::Secret { .. });
     let hop = match &prompt {
         remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => *hop,
     };
-    if matches!(prompt, remote::Prompt::Secret { .. })
-        && let Some(answer) = cache.lock().unwrap().get(hop)
-    {
+    if is_secret && let Some(answer) = cache.lock().unwrap().get(hop) {
         return Ok(Some(answer));
     }
     let (reply, answer) = mpsc::channel();
@@ -232,7 +231,7 @@ fn ask_remote(
         }
         match answer.recv_timeout(Duration::from_millis(50)) {
             Ok(Some(value)) => {
-                if hop == "跳板机" || hop == "家里 Windows" {
+                if is_secret {
                     cache.lock().unwrap().put(hop, value.clone());
                 }
                 return Ok(Some(value));
@@ -371,11 +370,8 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
     let worker = thread::spawn(move || {
         let result = (|| {
             for (index, source) in sources.iter().enumerate() {
-                let name = source
-                    .file_name()
-                    .ok_or_else(|| "远程路径没有文件名".to_string())?
-                    .to_string_lossy()
-                    .to_string();
+                let name =
+                    remote::file_name(&source.to_string_lossy()).map_err(|e| e.to_string())?;
                 remote::transfer::download(
                     &config,
                     &source.to_string_lossy(),
@@ -930,15 +926,21 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                     Ok(message) => {
                         ui.set_progress(1.0);
                         ui.set_status(message.into());
-                        ui.set_detail("远程目录上传完成；密码缓存仍会在 5 分钟后过期。".into());
-                        ui.set_history("目录使用 scp -r 递归上传；本次 SSH 会话已关闭。".into());
+                        ui.set_detail("文件或目录传输完成；点击刷新更新远程目录快照。".into());
+                        ui.set_history(
+                            "两段传输和跳板机暂存清理已完成，本次 SSH 会话已关闭。".into(),
+                        );
                     }
                     Err(error) => {
-                        ui.set_status("远程上传失败，SSH 已断开".into());
+                        state.borrow().credentials.lock().unwrap().clear();
+                        ui.set_status("远程传输未完成，SSH 已断开".into());
+                        ui.set_history(error.clone().into());
                         ui.set_detail(error.into());
                     }
                 }
                 paint_pane(ui, state, 1);
+                let local = state.borrow().panes[0].path.clone();
+                navigate(ui, state, 0, local);
             }
         }
     }
@@ -1064,6 +1066,32 @@ mod ui_tests {
     use super::*;
     use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
     use slint::{LogicalPosition, LogicalSize, platform::PointerEventButton};
+
+    #[test]
+    fn host_key_acceptance_never_becomes_a_cached_password() {
+        let (tx, rx) = mpsc::channel();
+        let cache = Arc::new(Mutex::new(remote::CredentialCache::default()));
+        let responder = thread::spawn(move || {
+            let Event::RemotePrompt(_, _, reply) = rx.recv().unwrap() else {
+                panic!("expected prompt")
+            };
+            reply.send(Some(Zeroizing::new("yes".into()))).unwrap();
+        });
+        let answer = ask_remote(
+            &tx,
+            1,
+            &AtomicBool::new(false),
+            &cache,
+            remote::Prompt::HostKey {
+                hop: "家里 Windows",
+                details: "test fingerprint".into(),
+            },
+        )
+        .unwrap();
+        responder.join().unwrap();
+        assert_eq!(answer.unwrap().as_str(), "yes");
+        assert!(cache.lock().unwrap().get("家里 Windows").is_none());
+    }
 
     fn wait_for(
         ui: &AppWindow,
