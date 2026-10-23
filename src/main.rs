@@ -196,6 +196,18 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
 
 fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
     ui.set_setting_route(config.route_text().into());
+    ui.set_setting_hops(ModelRc::new(VecModel::from(
+        config
+            .intermediates()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| HopRow {
+                host: node.host.into(),
+                user: node.user.into(),
+                port: node.port.into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
     ui.set_remote_label(config.windows_host.clone().into());
     ui.set_setting_jump_host(config.jump_host.clone().into());
     ui.set_setting_jump_port(config.jump_port.clone().into());
@@ -471,6 +483,27 @@ fn set_remote_not_ready(ui: &AppWindow) {
 
 fn wire(ui: &AppWindow, state: &Shared) {
     let weak = ui.as_weak();
+    ui.on_change_hop(move |action, index| {
+        let ui = weak.unwrap();
+        let mut rows: Vec<_> = ui.get_setting_hops().iter().collect();
+        let index = index as usize;
+        match action {
+            0 if rows.len() < 7 => rows.push(HopRow {
+                host: "".into(),
+                user: "".into(),
+                port: "22".into(),
+            }),
+            1 if index < rows.len() => {
+                rows.remove(index);
+            }
+            2 if index > 0 && index < rows.len() => rows.swap(index, index - 1),
+            3 if index + 1 < rows.len() => rows.swap(index, index + 1),
+            4 => rows.clear(),
+            _ => return,
+        }
+        ui.set_setting_hops(ModelRc::new(VecModel::from(rows)));
+    });
+    let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_auth_submit(move || {
         let ui = weak.unwrap();
@@ -517,12 +550,26 @@ fn wire(ui: &AppWindow, state: &Shared) {
               windows_port,
               windows_user,
               windows_root,
-              route| {
+              _route| {
             if shared.borrow().busy || shared.borrow().remote_worker.is_some() {
                 return;
             }
+            let ui = weak.unwrap();
+            let mut route = Vec::new();
+            for (index, row) in ui.get_setting_hops().iter().enumerate() {
+                let node = config::SshNode {
+                    host: row.host.trim().into(),
+                    user: row.user.trim().into(),
+                    port: row.port.trim().into(),
+                };
+                if let Err(error) = node.validate() {
+                    ui.set_settings_error(format!("中转节点 {}：{error}", index + 1).into());
+                    return;
+                }
+                route.push(format!("{} {} {}", node.host, node.port, node.user));
+            }
             let config = RemoteConfig {
-                route: Some(route.to_string()),
+                route: Some(route.join("\n")),
                 jump_host: jump_host.to_string(),
                 jump_port: jump_port.to_string(),
                 jump_user: jump_user.to_string(),
@@ -1375,6 +1422,33 @@ mod ui_tests {
         ui.set_setting_jump_host("bastion.example.com".into());
         ui.set_setting_windows_host("100.64.0.2".into());
         ui.set_setting_windows_root("C:/Users/home".into());
+        let original_hops: Vec<_> = ui.get_setting_hops().iter().collect();
+        ui.invoke_change_hop(0, 0);
+        let model = ui.get_setting_hops();
+        let last = model.row_count() - 1;
+        let mut added = model.row_data(last).unwrap();
+        assert_eq!(added.port, "22");
+        added.host = "second.example.com".into();
+        added.user = "alice".into();
+        model.set_row_data(last, added);
+        ui.invoke_change_hop(2, last as i32);
+        assert_eq!(
+            ui.get_setting_hops().row_data(last - 1).unwrap().host,
+            "second.example.com"
+        );
+        ui.invoke_change_hop(3, (last - 1) as i32);
+        ui.invoke_change_hop(1, last as i32);
+        assert_eq!(
+            ui.get_setting_hops().iter().collect::<Vec<_>>(),
+            original_hops
+        );
+        for _ in 0..10 {
+            ui.invoke_change_hop(0, 0);
+        }
+        assert_eq!(ui.get_setting_hops().row_count(), 7);
+        ui.invoke_change_hop(4, 0);
+        assert_eq!(ui.get_setting_hops().row_count(), 0);
+        paint_remote_config(&ui, &state.borrow().remote_config);
         snapshot(&ui, "remote-settings.png");
         ui.invoke_cancel_settings();
         ui.hide().unwrap();

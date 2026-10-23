@@ -213,7 +213,7 @@ impl SshNode {
     pub fn label(&self) -> String {
         format!("{}@{}:{}", self.user, self.host, self.port)
     }
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.host.is_empty()
             || self.host.starts_with('-')
             || self

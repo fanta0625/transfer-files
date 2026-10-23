@@ -1,5 +1,7 @@
 import { Button, CheckBox, LineEdit, ProgressIndicator, ListView, TextEdit } from "std-widgets.slint";
 
+export struct HopRow { host: string, user: string, port: string }
+
 export struct FileRow {
     name: string,
     kind: string,
@@ -149,6 +151,8 @@ export component AppWindow inherits Window {
     in property <string> detail;
     in property <string> history;
     in-out property <string> setting-route;
+    in-out property <[HopRow]> setting-hops;
+    callback change-hop(int, int);
     in property <string> remote-label;
     in-out property <string> setting-jump-host;
     in-out property <string> setting-jump-port;
@@ -263,8 +267,8 @@ export component AppWindow inherits Window {
         TouchArea { }
         Rectangle {
             x: (root.width - 620px) / 2;
-            y: (root.height - 580px) / 2;
-            width: 620px; height: 580px;
+            y: (root.height - 620px) / 2;
+            width: 620px; height: 620px;
             background: #ffffff;
             border-radius: 10px;
             border-width: 1px;
@@ -278,11 +282,29 @@ export component AppWindow inherits Window {
                     color: #526570; font-size: 12px; wrap: word-wrap;
                 }
                 Text { text: "中转节点（可选，按连接顺序从上到下）"; color: #178477; font-size: 14px; font-weight: 700; }
-                Text { text: "每行：user@example.com -p 22（可加 ssh 前缀）。留空直连；中转需 POSIX shell。"; wrap: word-wrap; font-size: 12px; }
-                TextEdit { text <=> root.setting-route; height: 100px; }
+                Text { text: "按表格顺序逐级连接；没有中转节点时直连。"; font-size: 12px; }
                 HorizontalLayout {
-                    Button { text: "添加一级中转"; clicked => { root.setting-route = root.setting-route + (root.setting-route == "" ? "" : "\n") + "user@example.com -p 22"; } }
-                    Button { text: "清空中转（直连）"; clicked => { root.setting-route = ""; } }
+                    spacing: 6px;
+                    Text { text: "IP / 域名"; horizontal-stretch: 1; }
+                    Text { text: "用户名"; width: 110px; }
+                    Text { text: "端口"; width: 65px; }
+                    Text { text: "顺序 / 删除"; width: 120px; }
+                }
+                ListView {
+                    height: 110px;
+                    for hop[index] in root.setting-hops : HorizontalLayout {
+                        spacing: 6px;
+                        LineEdit { text <=> hop.host; placeholder-text: "example.com"; horizontal-stretch: 1; }
+                        LineEdit { text <=> hop.user; placeholder-text: "user"; width: 110px; }
+                        LineEdit { text <=> hop.port; placeholder-text: "22"; width: 65px; }
+                        Button { text: "↑"; width: 36px; enabled: index > 0; clicked => { root.change-hop(2, index); } }
+                        Button { text: "↓"; width: 36px; enabled: index + 1 < root.setting-hops.length; clicked => { root.change-hop(3, index); } }
+                        Button { text: "×"; width: 36px; clicked => { root.change-hop(1, index); } }
+                    }
+                }
+                HorizontalLayout {
+                    Button { text: "添加一级中转"; enabled: root.setting-hops.length < 7; clicked => { root.change-hop(0, 0); } }
+                    Button { text: "清空中转（直连）"; clicked => { root.change-hop(4, 0); } }
                 }
                 Text { text: root.setting-windows-host == "" ? "目标 SSH 主机（Windows）" : "目标 · " + root.setting-windows-host; color: #178477; font-size: 14px; font-weight: 700; }
                 HorizontalLayout {
