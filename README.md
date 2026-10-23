@@ -48,6 +48,22 @@ bash scripts/run.sh
 
 如果希望从 KDE 应用菜单启动，可以把 `scripts/run.sh` 添加为桌面快捷方式；脚本所在的项目目录需要保留不变。源代码更新后重新执行一次 `cargo build --release --locked` 即可。
 
+## 打包为 deb（在目标 Linux 电脑上）
+
+安装打包工具后，在项目目录执行：
+
+```bash
+sudo apt install dpkg-dev python3
+bash scripts/build-deb.sh
+sudo apt install ./target/debian/transfer-files_*.deb
+```
+
+脚本自动构建 Release，读取项目版本与 `dpkg --print-architecture`，生成 `target/debian/transfer-files_版本_架构.deb`。在 Loongnix 龙芯电脑运行即可生成本机架构的包；请在相同发行版/版本和架构的电脑安装，不要把其他架构生成的包用于龙芯。
+
+安装后从 KDE 应用菜单搜索“文件传输”或执行 `transfer-files`。项目目录可以移走，个人配置仍留在用户配置目录，不会打入安装包。更新代码后重新打包并安装即可；卸载用 `sudo apt remove transfer-files`（保留个人配置）。
+
+若已经编译好本机程序，可省略构建：`bash scripts/build-deb.sh --binary /绝对路径/transfer-files`。打包无需 sudo。使用软件渲染，桌面入口默认 X11，与现有启动脚本一致。
+
 ## 读取家里 Windows 的目录
 
 ### 通用连接设置（2026-10-23）
