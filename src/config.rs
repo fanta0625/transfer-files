@@ -25,18 +25,7 @@ impl RemoteConfig {
                 .filter(|line| !line.trim().is_empty())
                 .enumerate()
                 .map(|(index, line)| {
-                    let (host, rest) = line
-                        .trim()
-                        .split_once(char::is_whitespace)
-                        .unwrap_or((line.trim(), ""));
-                    let (port, user) = rest
-                        .trim_start()
-                        .split_once(char::is_whitespace)
-                        .unwrap_or((rest.trim(), ""));
-                    let (host, port, user) =
-                        (host.to_string(), port.to_string(), user.trim().to_string());
-                    let node = SshNode { host, port, user };
-                    node.validate()
+                    let node = SshNode::parse_route_line(line)
                         .map_err(|e| format!("中转节点 {}：{e}", index + 1))?;
                     Ok(node)
                 })
@@ -73,7 +62,7 @@ impl RemoteConfig {
             self.intermediates()
                 .unwrap_or_default()
                 .iter()
-                .map(|n| format!("{} {} {}", n.host, n.port, n.user))
+                .map(|n| format!("{}@{} -p {}", n.user, n.host, n.port))
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -171,6 +160,55 @@ pub struct SshNode {
     pub user: String,
 }
 impl SshNode {
+    fn parse_route_line(line: &str) -> Result<Self, String> {
+        let tokens: Vec<_> = line.split_whitespace().collect();
+        // Preserve the previous host/port/user format, including usernames with spaces.
+        if tokens.len() >= 3 && tokens[1].parse::<u16>().is_ok() {
+            let (host, rest) = line.trim().split_once(char::is_whitespace).unwrap();
+            let (port, user) = rest.trim_start().split_once(char::is_whitespace).unwrap();
+            let node = Self {
+                host: host.into(),
+                port: port.into(),
+                user: user.trim().into(),
+            };
+            node.validate()?;
+            return Ok(node);
+        }
+        let mut args = tokens.iter().copied().peekable();
+        if args.peek() == Some(&"ssh") {
+            args.next();
+        }
+        let mut destination = None;
+        let mut port = None;
+        while let Some(arg) = args.next() {
+            if arg == "-p" {
+                if port.is_some() {
+                    return Err("请勿重复指定 -p 端口".into());
+                }
+                port = Some(args.next().ok_or("-p 后需要端口")?);
+            } else if let Some(value) = arg.strip_prefix("-p") {
+                if port.is_some() {
+                    return Err("请勿重复指定 -p 端口".into());
+                }
+                port = Some(value);
+            } else if arg.starts_with('-') || destination.replace(arg).is_some() {
+                return Err(
+                    "请输入 user@example.com -p 22（可加 ssh 前缀，仅支持 -p 选项）".into(),
+                );
+            }
+        }
+        let (user, host) = destination
+            .and_then(|d| d.rsplit_once('@'))
+            .ok_or("请输入 user@example.com -p 22，必须包含用户名和地址")?;
+        let node = Self {
+            host: host.into(),
+            port: port.unwrap_or("22").into(),
+            user: user.into(),
+        };
+        node.validate()?;
+        Ok(node)
+    }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn label(&self) -> String {
         format!("{}@{}:{}", self.user, self.host, self.port)
@@ -220,6 +258,46 @@ fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::RemoteConfig;
+    #[test]
+    fn ssh_style_routes_and_invalid_arguments() {
+        for line in [
+            "alice@example.com -p 2222",
+            "ssh -p 2222 alice@example.com",
+            "ssh alice@example.com -p2222",
+            "example.com 2222 alice",
+        ] {
+            let node = super::SshNode::parse_route_line(line).unwrap();
+            assert_eq!(node.label(), "alice@example.com:2222");
+        }
+        assert_eq!(
+            super::SshNode::parse_route_line("alice@example.com")
+                .unwrap()
+                .port,
+            "22"
+        );
+        for line in [
+            "ssh",
+            "example.com",
+            "alice@example.com -p",
+            "alice@example.com -p 0",
+            "alice@example.com -p nope",
+            "alice@example.com -p 22 -p 23",
+            "ssh -J jump alice@example.com",
+            "alice@example.com echo hi",
+            "@example.com",
+        ] {
+            assert!(super::SshNode::parse_route_line(line).is_err(), "{line}");
+        }
+        let config = RemoteConfig {
+            route: Some("ssh alice@example.com -p 2222\nbob@second.example.com".into()),
+            ..RemoteConfig::default()
+        };
+        assert_eq!(
+            RemoteConfig::from_contents(&config.to_contents()).intermediates(),
+            config.intermediates()
+        );
+    }
+
     #[test]
     fn migrate_direct_and_recursive_routes_roundtrip() {
         let legacy = RemoteConfig::from_contents(

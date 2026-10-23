@@ -278,10 +278,10 @@ export component AppWindow inherits Window {
                     color: #526570; font-size: 12px; wrap: word-wrap;
                 }
                 Text { text: "中转节点（可选，按连接顺序从上到下）"; color: #178477; font-size: 14px; font-weight: 700; }
-                Text { text: "每行：地址 端口 用户名。留空则直连下方目标。中转节点需支持 POSIX shell。"; wrap: word-wrap; font-size: 12px; }
+                Text { text: "每行：user@example.com -p 22（可加 ssh 前缀）。留空直连；中转需 POSIX shell。"; wrap: word-wrap; font-size: 12px; }
                 TextEdit { text <=> root.setting-route; height: 100px; }
                 HorizontalLayout {
-                    Button { text: "添加一级中转"; clicked => { root.setting-route = root.setting-route + (root.setting-route == "" ? "" : "\n") + "host.example.com 22 user"; } }
+                    Button { text: "添加一级中转"; clicked => { root.setting-route = root.setting-route + (root.setting-route == "" ? "" : "\n") + "user@example.com -p 22"; } }
                     Button { text: "清空中转（直连）"; clicked => { root.setting-route = ""; } }
                 }
                 Text { text: root.setting-windows-host == "" ? "目标 SSH 主机（Windows）" : "目标 · " + root.setting-windows-host; color: #178477; font-size: 14px; font-weight: 700; }
