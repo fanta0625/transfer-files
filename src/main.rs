@@ -195,6 +195,8 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
 }
 
 fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
+    ui.set_setting_route(config.route_text().into());
+    ui.set_remote_label(config.windows_host.clone().into());
     ui.set_setting_jump_host(config.jump_host.clone().into());
     ui.set_setting_jump_port(config.jump_port.clone().into());
     ui.set_setting_jump_user(config.jump_user.clone().into());
@@ -213,9 +215,9 @@ fn ask_remote(
 ) -> std::io::Result<remote::Answer> {
     let is_secret = matches!(prompt, remote::Prompt::Secret { .. });
     let hop = match &prompt {
-        remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => *hop,
+        remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => hop.clone(),
     };
-    if is_secret && let Some(answer) = cache.lock().unwrap().get(hop) {
+    if is_secret && let Some(answer) = cache.lock().unwrap().get(&hop) {
         return Ok(Some(answer));
     }
     let (reply, answer) = mpsc::channel();
@@ -232,7 +234,7 @@ fn ask_remote(
         match answer.recv_timeout(Duration::from_millis(50)) {
             Ok(Some(value)) => {
                 if is_secret {
-                    cache.lock().unwrap().put(hop, value.clone());
+                    cache.lock().unwrap().put(&hop, value.clone());
                 }
                 return Ok(Some(value));
             }
@@ -267,7 +269,19 @@ fn navigate(ui: &AppWindow, state: &Shared, side: usize, path: PathBuf) {
     };
     let credentials = state.borrow().credentials.clone();
     if remote_pane {
-        ui.set_status("正在连接跳板机与家里 Windows…".into());
+        ui.set_status(
+            format!(
+                "正在连接 {}…",
+                remote_config
+                    .nodes()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|n| n.host.clone())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            )
+            .into(),
+        );
         ui.set_remote_reading(true);
     }
     paint_pane(ui, state, side);
@@ -502,11 +516,13 @@ fn wire(ui: &AppWindow, state: &Shared) {
               windows_host,
               windows_port,
               windows_user,
-              windows_root| {
+              windows_root,
+              route| {
             if shared.borrow().busy || shared.borrow().remote_worker.is_some() {
                 return;
             }
             let config = RemoteConfig {
+                route: Some(route.to_string()),
                 jump_host: jump_host.to_string(),
                 jump_port: jump_port.to_string(),
                 jump_user: jump_user.to_string(),
@@ -527,6 +543,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
                     let remote_root = PathBuf::from(&config.windows_root);
                     {
                         let mut state = shared.borrow_mut();
+                        state.credentials.lock().unwrap().clear();
+                        ui.set_remote_label(config.windows_host.clone().into());
                         state.remote_config = config;
                         state.panes[1].remote = true;
                         state.panes[1].path = remote_root.clone();
@@ -830,7 +848,7 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                                         .to_string(),
                                 );
                                 ui.set_status("远程目录已更新，SSH 已断开".into());
-                                ui.set_history("右栏保留本次目录快照；双击目录、返回上级或刷新会重新连接认证。远程传输尚未接入。".into());
+                                ui.set_history("右栏保留目录快照；双击、上级或刷新会重新连接，5 分钟内复用各节点密码。".into());
                             }
                         }
                         Err(error) => {
@@ -927,9 +945,7 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                         ui.set_progress(1.0);
                         ui.set_status(message.into());
                         ui.set_detail("文件或目录传输完成；点击刷新更新远程目录快照。".into());
-                        ui.set_history(
-                            "两段传输和跳板机暂存清理已完成，本次 SSH 会话已关闭。".into(),
-                        );
+                        ui.set_history("连接链传输和暂存清理已完成，本次 SSH 会话已关闭。".into());
                     }
                     Err(error) => {
                         state.borrow().credentials.lock().unwrap().clear();
@@ -1083,7 +1099,7 @@ mod ui_tests {
             &AtomicBool::new(false),
             &cache,
             remote::Prompt::HostKey {
-                hop: "家里 Windows",
+                hop: "家里 Windows".into(),
                 details: "test fingerprint".into(),
             },
         )
@@ -1234,6 +1250,7 @@ mod ui_tests {
             state.panes[1].remote = true;
             state.panes[1].generation += 1;
             state.remote_config = RemoteConfig {
+                route: None,
                 jump_host: "bastion.example.com".into(),
                 jump_port: "22".into(),
                 jump_user: "jump-user".into(),
@@ -1306,7 +1323,7 @@ mod ui_tests {
             .send(Event::RemotePrompt(
                 generation,
                 remote::Prompt::HostKey {
-                    hop: "跳板机",
+                    hop: "跳板机".into(),
                     details: "ED25519 key fingerprint is SHA256:example.\n请核对主机指纹。".into(),
                 },
                 reply,
@@ -1325,7 +1342,7 @@ mod ui_tests {
             .send(Event::RemotePrompt(
                 generation,
                 remote::Prompt::Secret {
-                    hop: "家里 Windows",
+                    hop: "家里 Windows".into(),
                 },
                 reply,
             ))
@@ -1344,7 +1361,9 @@ mod ui_tests {
             .tx
             .send(Event::RemotePrompt(
                 generation,
-                remote::Prompt::Secret { hop: "跳板机" },
+                remote::Prompt::Secret {
+                    hop: "跳板机".into(),
+                },
                 reply,
             ))
             .unwrap();

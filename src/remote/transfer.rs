@@ -51,25 +51,13 @@ fn scp_args(port: &str, source: &str, target: &str) -> Vec<String> {
     args
 }
 
-fn jump(config: &RemoteConfig, script: &str) -> CommandBuilder {
-    let mut c = CommandBuilder::new("ssh");
-    c.args(["-tt", "-e", "none"]);
-    c.args(OPTIONS);
-    c.args([
-        "-p",
-        &config.jump_port,
-        "-l",
-        &config.jump_user,
-        "--",
-        &config.jump_host,
-        script,
-    ]);
-    environment(&mut c);
-    c
-}
-
-fn local_scp(config: &RemoteConfig, local: &Path, staging: &str, download: bool) -> CommandBuilder {
-    let remote = endpoint(&config.jump_user, &config.jump_host, staging);
+fn local_scp_node(
+    node: &crate::config::SshNode,
+    local: &Path,
+    remote_path: &str,
+    download: bool,
+) -> CommandBuilder {
+    let remote = endpoint(&node.user, &node.host, remote_path);
     let local = local.to_string_lossy();
     let (source, target) = if download {
         (remote.as_str(), local.as_ref())
@@ -77,11 +65,38 @@ fn local_scp(config: &RemoteConfig, local: &Path, staging: &str, download: bool)
         (local.as_ref(), remote.as_str())
     };
     let mut c = CommandBuilder::new("scp");
-    c.args(scp_args(&config.jump_port, source, target));
+    c.args(scp_args(&node.port, source, target));
     environment(&mut c);
+    c.env("TF_NODE_LABEL", node.label());
     c
 }
-
+fn edge_scp(
+    nodes: &[crate::config::SshNode],
+    index: usize,
+    remote_path: &str,
+    staging: &str,
+    id: &str,
+    download: bool,
+) -> CommandBuilder {
+    let next = &nodes[index + 1];
+    let remote = endpoint(&next.user, &next.host, remote_path);
+    let (source, target) = if download {
+        (remote.as_str(), staging)
+    } else {
+        (staging, remote.as_str())
+    };
+    let script = format!(
+        "stty -echo; printf '%s\\n' {}; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never scp {}",
+        quote(&super::terminal::marker(next, id)),
+        scp_args(&next.port, source, target)
+            .iter()
+            .map(|v| quote(v))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    super::terminal::chain_command(&nodes[..=index], &script, id, true)
+}
+#[cfg(test)]
 fn nested_scp(
     config: &RemoteConfig,
     windows: &str,
@@ -89,31 +104,15 @@ fn nested_scp(
     id: &str,
     download: bool,
 ) -> CommandBuilder {
-    // Windows FullName uses backslashes. SCP/SFTP expects forward slashes.
-    let windows = endpoint(
-        &config.windows_user,
-        &config.windows_host,
+    edge_scp(
+        &config.nodes().unwrap(),
+        0,
         &windows.replace('\\', "/"),
-    );
-    let (source, target) = if download {
-        (windows.as_str(), staging)
-    } else {
-        (staging, windows.as_str())
-    };
-    let args = scp_args(&config.windows_port, source, target);
-    // Quote individual arguments, never the entire command as one executable.
-    jump(
-        config,
-        &format!(
-            "stty -echo; printf '\\nTF_HOP2_{id}\\n'; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never scp {}",
-            args.iter()
-                .map(|arg| quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        staging,
+        id,
+        download,
     )
 }
-
 fn transfer(
     config: &RemoteConfig,
     local: &Path,
@@ -122,61 +121,92 @@ fn transfer(
     mut execute: impl FnMut(CommandBuilder, &str) -> io::Result<String>,
 ) -> io::Result<()> {
     config.validate().map_err(io::Error::other)?;
+    let nodes = config.nodes().map_err(io::Error::other)?;
     let id = token();
+    let windows = windows.replace('\\', "/");
+    if nodes.len() == 1 {
+        execute(local_scp_node(&nodes[0], local, &windows, download), &id)?;
+        return Ok(());
+    }
     let directory = format!("/tmp/transfer-files-{id}");
     let payload = format!("{directory}/payload");
-    // mkdir must succeed before any transfer; do not reuse an existing directory.
-    execute(
-        jump(
-            config,
+    let intermediates = nodes.len() - 1;
+    for index in 0..intermediates {
+        let cmd = super::terminal::chain_command(
+            &nodes[..=index],
             &format!("umask 077; mkdir -- {}", quote(&directory)),
-        ),
-        &id,
-    )
-    .map_err(|e| io::Error::new(e.kind(), format!("创建跳板机暂存目录失败：{e}")))?;
-    let stages = if download {
-        [
-            (
-                nested_scp(config, windows, &payload, &id, true),
-                "下载第 1 段（Windows → 跳板机）",
-            ),
-            (
-                local_scp(config, local, &payload, true),
-                "下载第 2 段（跳板机 → 本地）",
-            ),
-        ]
+            &id,
+            true,
+        );
+        execute(cmd, &id).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{} 创建暂存目录失败：{e}；此前节点可能保留 {directory}",
+                    nodes[index].label()
+                ),
+            )
+        })?;
+    }
+    let mut stages = Vec::new();
+    if !download {
+        stages.push((
+            local_scp_node(&nodes[0], local, &payload, false),
+            format!("本地 → {}", nodes[0].label()),
+        ));
+    }
+    let indices: Vec<_> = if download {
+        (0..intermediates).rev().collect()
     } else {
-        [
-            (
-                local_scp(config, local, &payload, false),
-                "上传第 1 段（本地 → 跳板机）",
-            ),
-            (
-                nested_scp(config, windows, &payload, &id, false),
-                "上传第 2 段（跳板机 → Windows）",
-            ),
-        ]
+        (0..intermediates).collect()
     };
+    for index in indices {
+        let remote_path = if index == intermediates - 1 {
+            &windows
+        } else {
+            &payload
+        };
+        let stage = if download {
+            format!("{} → {}", nodes[index + 1].label(), nodes[index].label())
+        } else {
+            format!("{} → {}", nodes[index].label(), nodes[index + 1].label())
+        };
+        stages.push((
+            edge_scp(&nodes, index, remote_path, &payload, &id, download),
+            stage,
+        ));
+    }
+    if download {
+        stages.push((
+            local_scp_node(&nodes[0], local, &payload, true),
+            format!("{} → 本地", nodes[0].label()),
+        ));
+    }
     for (cmd, stage) in stages {
         execute(cmd, &id).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("{stage}失败：{e}；暂存可能保留在跳板机 {directory}"),
+                format!("{stage} 失败：{e}；中转节点可能保留 {directory}"),
             )
         })?;
     }
-    // The payload must survive BOTH hops. Delete only our successfully created
-    // staging directory, never a user-supplied source or destination path.
-    execute(
-        jump(config, &format!("rm -rf -- {}", quote(&directory))),
-        &id,
-    )
-    .map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("文件已传输，但跳板机暂存清理失败：{directory}；{e}"),
-        )
-    })?;
+    for index in (0..intermediates).rev() {
+        let cmd = super::terminal::chain_command(
+            &nodes[..=index],
+            &format!("rm -rf -- {}", quote(&directory)),
+            &id,
+            true,
+        );
+        execute(cmd, &id).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "传输完成，但 {} 暂存清理失败：{directory}；{e}",
+                    nodes[index].label()
+                ),
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -229,9 +259,57 @@ pub fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_and_recursive_transfer_plans_use_every_node_in_order() {
+        for download in [true, false] {
+            for count in [1, 2, 4] {
+                let mut config = config();
+                config.route = Some(
+                    (0..count - 1)
+                        .map(|i| format!("hop{i}.test {} user{i}", 2200 + i))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                let mut calls = Vec::new();
+                transfer(
+                    &config,
+                    Path::new("/tmp/item"),
+                    "C:/item",
+                    download,
+                    |cmd, _| {
+                        calls.push(cmd.get_argv().clone());
+                        Ok(String::new())
+                    },
+                )
+                .unwrap();
+                if count == 1 {
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0][0], "scp");
+                    let remote = endpoint(&config.windows_user, &config.windows_host, "C:/item");
+                    assert_eq!(
+                        calls[0][calls[0].len() - if download { 2 } else { 1 }],
+                        remote.as_str()
+                    );
+                } else {
+                    assert_eq!(calls.len(), count + 2 * (count - 1));
+                    // Every edge transfers exactly once. The outer SCP is first
+                    // when uploading and last when downloading.
+                    let first_transfer = count - 1;
+                    let local_index = first_transfer + if download { count - 1 } else { 0 };
+                    assert_eq!(calls[local_index][0], "scp");
+                    assert!(
+                        calls[first_transfer..first_transfer + count]
+                            .iter()
+                            .all(|args| !args.last().unwrap().to_string_lossy().contains("rm -rf"))
+                    );
+                }
+            }
+        }
+    }
 
     fn config() -> RemoteConfig {
         RemoteConfig {
+            route: None,
             jump_host: "jump.test".into(),
             jump_port: "2201".into(),
             jump_user: "alice".into(),
@@ -268,9 +346,13 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "{:?}", output);
             let stdout = String::from_utf8(output.stdout).unwrap();
-            assert!(stdout.starts_with("\nTF_HOP2_test\n"));
+            let marker = format!(
+                "{}\n",
+                super::super::terminal::marker(&config.nodes().unwrap()[1], "test")
+            );
+            assert!(stdout.starts_with(&marker));
             let args = stdout
-                .trim_start_matches("\nTF_HOP2_test\n")
+                .trim_start_matches(&marker)
                 .split('\0')
                 .collect::<Vec<_>>();
             assert!(args.windows(2).any(|v| v == ["-P", "2202"]));

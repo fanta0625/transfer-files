@@ -53,43 +53,88 @@ pub(crate) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn command(config: &RemoteConfig, path: &str, token: &str) -> CommandBuilder {
-    // The jump-host PTY is needed only for the second ssh client's authentication.
-    // Windows receives no PTY; its machine-readable output stays unwrapped.
-    let mut inner = vec!["ssh".to_string(), "-T".to_string()];
-    inner.extend(OPTIONS.iter().map(|s| s.to_string()));
-    inner.extend([
-        "-p".into(),
-        config.windows_port.clone(),
-        "-l".into(),
-        config.windows_user.clone(),
-        "--".into(),
-        config.windows_host.clone(),
-        format!(
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
-            protocol::encode_utf16le(&protocol::script(path, token))
-        ),
-    ]);
-    let nested = format!(
-        "stty -echo; printf '\\nTF_HOP2_{token}\\n'; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never {}",
-        inner.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
-    );
+pub(crate) fn marker(node: &crate::config::SshNode, token: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "TF_NODE_{token}:{}",
+        base64::engine::general_purpose::STANDARD.encode(node.label())
+    )
+}
+pub(crate) fn chain_command(
+    nodes: &[crate::config::SshNode],
+    script: &str,
+    token: &str,
+    tty: bool,
+) -> CommandBuilder {
+    assert!(!nodes.is_empty());
+    let mut script = script.to_string();
+    for index in (1..nodes.len()).rev() {
+        let node = &nodes[index];
+        let mut args = vec![
+            "ssh".to_string(),
+            if index == nodes.len() - 1 && !tty {
+                "-T"
+            } else {
+                "-tt"
+            }
+            .into(),
+            "-e".into(),
+            "none".into(),
+        ];
+        args.extend(OPTIONS.iter().map(|v| v.to_string()));
+        args.extend([
+            "-p".into(),
+            node.port.clone(),
+            "-l".into(),
+            node.user.clone(),
+            "--".into(),
+            node.host.clone(),
+            script,
+        ]);
+        script = format!(
+            "stty -echo; printf '%s\\n' {}; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never {}",
+            quote(&marker(node, token)),
+            args.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" ")
+        );
+    }
+    let first = &nodes[0];
     let mut cmd = CommandBuilder::new("ssh");
-    cmd.args(["-tt", "-e", "none"]);
+    cmd.args([
+        if nodes.len() == 1 && !tty {
+            "-T"
+        } else {
+            "-tt"
+        },
+        "-e",
+        "none",
+    ]);
     cmd.args(OPTIONS);
     cmd.args([
         "-p",
-        &config.jump_port,
+        &first.port,
         "-l",
-        &config.jump_user,
+        &first.user,
         "--",
-        &config.jump_host,
-        &nested,
+        &first.host,
+        &script,
     ]);
+    cmd.env("TF_NODE_LABEL", first.label());
     cmd.env("LC_ALL", "C");
     cmd.env("SSH_ASKPASS_REQUIRE", "never");
     cmd.env_remove("SSH_ASKPASS");
     cmd
+}
+fn command(config: &RemoteConfig, path: &str, token: &str) -> CommandBuilder {
+    let script = format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
+        protocol::encode_utf16le(&protocol::script(path, token))
+    );
+    chain_command(
+        &config.nodes().expect("validated configuration"),
+        &script,
+        token,
+        false,
+    )
 }
 
 pub fn read_directory(
@@ -130,6 +175,11 @@ pub fn run_command(
     mut ask: impl FnMut(Prompt) -> io::Result<Answer>,
     timeout: Duration,
 ) -> io::Result<String> {
+    let initial_hop = cmd
+        .get_env("TF_NODE_LABEL")
+        .and_then(|s| s.to_str())
+        .unwrap_or("SSH")
+        .to_string();
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 40,
@@ -164,8 +214,7 @@ pub fn run_command(
     let result = (|| {
         let mut output = Zeroizing::new(String::new());
         let mut prompt_buffer = String::new();
-        let mut hop = "跳板机";
-        let hop_marker = format!("TF_HOP2_{token}");
+        let mut hop = initial_hop;
         let data_marker = format!("TF_LIST_V1_BEGIN_{token}");
         let mut data_started = false;
         let mut idle = Instant::now();
@@ -193,26 +242,36 @@ pub fn run_command(
                         return Err(io::Error::other("目录响应超过 16 MiB，请选择更小的目录"));
                     }
                     prompt_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    if prompt_buffer.contains(&hop_marker) {
-                        hop = "家里 Windows";
-                        prompt_buffer =
-                            prompt_buffer.split_once(&hop_marker).unwrap().1.to_string();
+                    let prefix = format!("TF_NODE_{token}:");
+                    while let Some(start) = prompt_buffer.find(&prefix) {
+                        let rest = &prompt_buffer[start + prefix.len()..];
+                        let Some(end) = rest.find(['\r', '\n']) else {
+                            break;
+                        };
+                        use base64::Engine as _;
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(&rest[..end])
+                            && let Ok(label) = String::from_utf8(bytes)
+                        {
+                            hop = label;
+                        }
+                        prompt_buffer = rest[end + 1..].to_string();
                     }
                     if prompt_buffer.contains(&data_marker) {
                         data_started = true;
                     }
                     if !data_started && let Some(host_key) = prompt_kind(&prompt_buffer) {
                         attempts += 1;
-                        if attempts > 8 {
+                        if attempts > 32 {
                             return Err(io::Error::other("SSH 认证请求过多，请检查认证配置"));
                         }
                         let prompt = if host_key {
                             Prompt::HostKey {
-                                hop,
+                                hop: hop.clone(),
                                 details: fingerprint_details(&prompt_buffer),
                             }
                         } else {
-                            Prompt::Secret { hop }
+                            Prompt::Secret { hop: hop.clone() }
                         };
                         let answer = ask(prompt)?.ok_or_else(|| {
                             io::Error::new(io::ErrorKind::Interrupted, "已取消认证，SSH 已断开")
@@ -246,7 +305,7 @@ pub fn run_command(
                             if output.contains(&format!("TF_ERROR_{token}\t")) {
                                 return protocol::parse(&output, token).map(|_| String::new());
                             }
-                            return Err(io::Error::other(ssh_error(&output, hop)));
+                            return Err(io::Error::other(ssh_error(&output, &hop)));
                         }
                         return Ok(output.to_string());
                     }
@@ -328,10 +387,66 @@ fn ssh_error(output: &str, hop: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recursive_chain_authentication_identifies_each_node() {
+        use crate::config::SshNode;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fake = temp.path().join("ssh");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/python3
+import sys,os,termios
+args=sys.argv[1:]
+host=args[args.index('--')+1]
+attrs=termios.tcgetattr(0); attrs[3] &= ~termios.ECHO; termios.tcsetattr(0,termios.TCSANOW,attrs)
+print("user@"+host+"'s password: ",end="",flush=True)
+assert input() == "secret-"+host
+os.execv('/bin/sh',['sh','-c',args[-1]])
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for count in [1, 2, 4] {
+            let nodes: Vec<_> = (0..count)
+                .map(|i| SshNode {
+                    host: format!("node{i}.test"),
+                    port: format!("{}", 2200 + i),
+                    user: "user".into(),
+                })
+                .collect();
+            let mut cmd = chain_command(&nodes, "printf 'finished\\n'", "test", false);
+            cmd.get_argv_mut()[0] = fake.clone().into_os_string();
+            cmd.env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()));
+            let mut seen = Vec::new();
+            let result = run_command(
+                cmd,
+                "test",
+                &AtomicBool::new(false),
+                |prompt| {
+                    let Prompt::Secret { hop } = prompt else {
+                        panic!("unexpected host key");
+                    };
+                    let index = seen.len();
+                    assert_eq!(hop, nodes[index].label());
+                    seen.push(hop);
+                    Ok(Some(Zeroizing::new(format!(
+                        "secret-{}",
+                        nodes[index].host
+                    ))))
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(result.contains("finished"));
+            assert_eq!(seen.len(), count);
+        }
+    }
 
     #[test]
     fn nested_shell_preserves_user_host_and_encoded_path_as_single_arguments() {
         let config = RemoteConfig {
+            route: None,
             jump_host: "jump.example".into(),
             jump_port: "22".into(),
             jump_user: "alice".into(),
@@ -395,7 +510,7 @@ assert input() == "yes"
 sys.stdout.write("alice@jump's pass"); sys.stdout.flush()
 sys.stdout.write("word: "); sys.stdout.flush()
 assert input() == "test-secret"
-print("\nTF_HOP2_test", flush=True)
+print("\nTF_NODE_test:Ym9iQHdpbmRvd3M6MjI=", flush=True)
 sys.stdout.write("bob@windows's password: "); sys.stdout.flush()
 assert input() == "test-secret"
 print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
@@ -424,7 +539,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
             Duration::from_secs(3),
         )
         .unwrap();
-        assert_eq!(hops, ["跳板机", "跳板机", "家里 Windows"]);
+        assert_eq!(hops, ["SSH", "SSH", "bob@windows:22"]);
         assert!(!output.contains("test-secret"));
         assert!(protocol::parse(&output, "test").is_ok());
     }

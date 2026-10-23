@@ -12,8 +12,8 @@ pub mod transfer;
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub enum Prompt {
-    Secret { hop: &'static str },
-    HostKey { hop: &'static str, details: String },
+    Secret { hop: String },
+    HostKey { hop: String, details: String },
 }
 
 pub type Answer = Option<Zeroizing<String>>;
@@ -34,39 +34,25 @@ pub fn file_name(path: &str) -> io::Result<String> {
 
 #[derive(Default)]
 pub struct CredentialCache {
-    pub jump: Option<Zeroizing<String>>,
-    pub windows: Option<Zeroizing<String>>,
-    pub expires_at: Option<std::time::Instant>,
+    entries: std::collections::HashMap<String, (Zeroizing<String>, std::time::Instant)>,
 }
-
 impl CredentialCache {
     pub fn clear(&mut self) {
-        self.jump = None;
-        self.windows = None;
-        self.expires_at = None;
-    }
-    pub fn valid(&self) -> bool {
-        self.expires_at
-            .is_some_and(|t| t > std::time::Instant::now())
+        self.entries.clear();
     }
     pub fn get(&mut self, hop: &str) -> Option<Zeroizing<String>> {
-        if !self.valid() {
-            self.clear();
-            return None;
-        }
-        match hop {
-            "跳板机" => self.jump.clone(),
-            "家里 Windows" => self.windows.clone(),
-            _ => None,
-        }
+        self.entries
+            .retain(|_, (_, expiry)| *expiry > std::time::Instant::now());
+        self.entries.get(hop).map(|(value, _)| value.clone())
     }
     pub fn put(&mut self, hop: &str, value: Zeroizing<String>) {
-        match hop {
-            "跳板机" => self.jump = Some(value),
-            "家里 Windows" => self.windows = Some(value),
-            _ => return,
-        }
-        self.expires_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(300));
+        self.entries.insert(
+            hop.into(),
+            (
+                value,
+                std::time::Instant::now() + std::time::Duration::from_secs(300),
+            ),
+        );
     }
 }
 
@@ -136,6 +122,19 @@ pub fn parent_path(path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_separates_nodes_and_expiration() {
+        let mut cache = CredentialCache::default();
+        cache.put("u@first:22", Zeroizing::new("first".into()));
+        cache.put("u@second:22", Zeroizing::new("second".into()));
+        assert_eq!(cache.get("u@first:22").unwrap().as_str(), "first");
+        assert!(cache.get("u@first:2222").is_none());
+        cache.entries.get_mut("u@first:22").unwrap().1 = std::time::Instant::now();
+        assert!(cache.get("u@first:22").is_none());
+        assert_eq!(cache.get("u@second:22").unwrap().as_str(), "second");
+        cache.clear();
+        assert!(cache.entries.is_empty());
+    }
     #[test]
     fn remote_file_name_uses_windows_separators_on_every_platform() {
         assert_eq!(file_name(r"C:\Users\home\资料.txt").unwrap(), "资料.txt");
