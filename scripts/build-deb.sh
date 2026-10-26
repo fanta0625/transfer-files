@@ -67,7 +67,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: Transfer Files contributors <noreply@example.com>
 Installed-Size: $SIZE
-Depends: $DEPENDS, openssh-client, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
+Depends: $DEPENDS, python3, openssh-client, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
 Description: GUI file transfer client over SSH
  Browse Windows directories and transfer files through optional SSH hops.
 EOF

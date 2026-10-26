@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use config::RemoteConfig;
+use config::{CachePolicy, NodeOptions, RemoteConfig, RemoteOs};
 use zeroize::Zeroizing;
 
 slint::include_modules!();
@@ -195,13 +195,36 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
 }
 
 fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
+    ui.set_setting_target_system(if config.target_options.os == RemoteOs::Windows {
+        1
+    } else {
+        0
+    });
+    ui.set_setting_target_identity(config.target_options.identity_file.clone().into());
+    ui.set_setting_cache_policy(config.cache_policy.index());
     ui.set_setting_route(config.route_text().into());
     ui.set_setting_hops(ModelRc::new(VecModel::from(
         config
             .intermediates()
             .unwrap_or_default()
             .into_iter()
-            .map(|node| HopRow {
+            .enumerate()
+            .map(|(index, node)| HopRow {
+                system: if config
+                    .hop_options
+                    .get(index)
+                    .is_some_and(|o| o.os == RemoteOs::Windows)
+                {
+                    1
+                } else {
+                    0
+                },
+                identity: config
+                    .hop_options
+                    .get(index)
+                    .map(|o| o.identity_file.clone())
+                    .unwrap_or_default()
+                    .into(),
                 host: node.host.into(),
                 user: node.user.into(),
                 port: node.port.into(),
@@ -225,9 +248,10 @@ fn ask_remote(
     cache: &Arc<Mutex<remote::CredentialCache>>,
     prompt: remote::Prompt,
 ) -> std::io::Result<remote::Answer> {
-    let is_secret = matches!(prompt, remote::Prompt::Secret { .. });
+    let is_secret = !matches!(prompt, remote::Prompt::HostKey { .. });
     let hop = match &prompt {
         remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => hop.clone(),
+        remote::Prompt::KeyPassphrase { hop, key } => format!("key:{hop}:{key}"),
     };
     if is_secret && let Some(answer) = cache.lock().unwrap().get(&hop) {
         return Ok(Some(answer));
@@ -397,7 +421,8 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
         let result = (|| {
             for (index, source) in sources.iter().enumerate() {
                 let name =
-                    remote::file_name(&source.to_string_lossy()).map_err(|e| e.to_string())?;
+                    remote::file_name_for(config.target_options.os, &source.to_string_lossy())
+                        .map_err(|e| e.to_string())?;
                 remote::transfer::download(
                     &config,
                     &source.to_string_lossy(),
@@ -447,7 +472,14 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
     ui.set_remote_reading(true);
     ui.set_progress(0.0);
     ui.set_status(format!("正在上传 {} 个项目…", sources.len()).into());
-    ui.set_detail(format!("目标：{}；密码缓存 5 分钟", target.display()).into());
+    ui.set_detail(
+        format!(
+            "目标：{}；{}；中断后可再次发起续传",
+            target.display(),
+            config.cache_policy.label()
+        )
+        .into(),
+    );
     let worker = thread::spawn(move || {
         let result = (|| {
             for (index, source) in sources.iter().enumerate() {
@@ -482,6 +514,12 @@ fn set_remote_not_ready(ui: &AppWindow) {
 }
 
 fn wire(ui: &AppWindow, state: &Shared) {
+    state
+        .borrow()
+        .credentials
+        .lock()
+        .unwrap()
+        .set_policy(state.borrow().remote_config.cache_policy);
     let weak = ui.as_weak();
     ui.on_change_hop(move |action, index| {
         let ui = weak.unwrap();
@@ -489,6 +527,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
         let index = index as usize;
         match action {
             0 if rows.len() < 7 => rows.push(HopRow {
+                system: 0,
+                identity: "".into(),
                 host: "".into(),
                 user: "".into(),
                 port: "22".into(),
@@ -561,6 +601,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
                     host: row.host.trim().into(),
                     user: row.user.trim().into(),
                     port: row.port.trim().into(),
+                    ..Default::default()
                 };
                 if let Err(error) = node.validate() {
                     ui.set_settings_error(format!("中转节点 {}：{error}", index + 1).into());
@@ -569,6 +610,27 @@ fn wire(ui: &AppWindow, state: &Shared) {
                 route.push(format!("{} {} {}", node.host, node.port, node.user));
             }
             let config = RemoteConfig {
+                hop_options: ui
+                    .get_setting_hops()
+                    .iter()
+                    .map(|row| NodeOptions {
+                        os: if row.system == 1 {
+                            RemoteOs::Windows
+                        } else {
+                            RemoteOs::Linux
+                        },
+                        identity_file: row.identity.trim().into(),
+                    })
+                    .collect(),
+                target_options: NodeOptions {
+                    os: if ui.get_setting_target_system() == 1 {
+                        RemoteOs::Windows
+                    } else {
+                        RemoteOs::Linux
+                    },
+                    identity_file: ui.get_setting_target_identity().trim().into(),
+                },
+                cache_policy: CachePolicy::from_index(ui.get_setting_cache_policy()),
                 route: Some(route.join("\n")),
                 jump_host: jump_host.to_string(),
                 jump_port: jump_port.to_string(),
@@ -590,6 +652,11 @@ fn wire(ui: &AppWindow, state: &Shared) {
                     let remote_root = PathBuf::from(&config.windows_root);
                     {
                         let mut state = shared.borrow_mut();
+                        state
+                            .credentials
+                            .lock()
+                            .unwrap()
+                            .set_policy(config.cache_policy);
                         state.credentials.lock().unwrap().clear();
                         ui.set_remote_label(config.windows_host.clone().into());
                         state.remote_config = config;
@@ -625,7 +692,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
         let side = side as usize;
         let mut path = PathBuf::from(path.as_str());
         if shared.borrow().panes[side].remote {
-            path = remote::resolve_path(
+            path = remote::resolve_path_for(
+                shared.borrow().remote_config.target_options.os,
                 &shared.borrow().panes[side].path.to_string_lossy(),
                 path.to_string_lossy().as_ref(),
             );
@@ -641,7 +709,10 @@ fn wire(ui: &AppWindow, state: &Shared) {
         let path = {
             let state = shared.borrow();
             if state.panes[side].remote {
-                remote::parent_path(&state.panes[side].path.to_string_lossy())
+                remote::parent_path_for(
+                    state.remote_config.target_options.os,
+                    &state.panes[side].path.to_string_lossy(),
+                )
             } else {
                 state.panes[side].path.parent().map(PathBuf::from)
             }
@@ -834,6 +905,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
 }
 
 fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
+    state.borrow().credentials.lock().unwrap().expire();
     // Keep an event-heavy directory or batch from monopolizing the GUI loop.
     for _ in 0..100 {
         let Ok(event) = rx.try_recv() else {
@@ -849,10 +921,29 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                     continue;
                 }
                 let (title, detail, host_key) = match prompt {
-                    remote::Prompt::Secret { hop } => (format!("{hop} · SSH 认证"),
-                        "请输入该端 SSH 密码（或私钥口令）。仅用于本次读取，不保存；两分钟内未提交将断开。".to_string(), false),
-                    remote::Prompt::HostKey { hop, details } => (format!("{hop} · 确认主机指纹"),
-                        format!("{details}\n请通过可信方式核对指纹。确认后由 OpenSSH 记录至该端 known_hosts。"), true),
+                    remote::Prompt::Secret { hop } => (
+                        format!("{hop} · SSH 认证"),
+                        format!(
+                            "请输入该端 SSH 密码。{}；不写入磁盘，两分钟内未提交将断开。",
+                            state.remote_config.cache_policy.label()
+                        ),
+                        false,
+                    ),
+                    remote::Prompt::KeyPassphrase { hop, key } => (
+                        format!("{hop} · 私钥口令"),
+                        format!(
+                            "{key}\n{}；不写入磁盘。",
+                            state.remote_config.cache_policy.label()
+                        ),
+                        false,
+                    ),
+                    remote::Prompt::HostKey { hop, details } => (
+                        format!("{hop} · 确认主机指纹"),
+                        format!(
+                            "{details}\n请通过可信方式核对指纹。确认后由 OpenSSH 记录至该端 known_hosts。"
+                        ),
+                        true,
+                    ),
                 };
                 state.auth_reply = Some(reply);
                 ui.set_auth_title(title.into());
@@ -895,12 +986,13 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                                         .to_string(),
                                 );
                                 ui.set_status("远程目录已更新，SSH 已断开".into());
-                                ui.set_history("右栏保留目录快照；双击、上级或刷新会重新连接，5 分钟内复用各节点密码。".into());
+                                ui.set_history("右栏保留目录快照；双击、上级或刷新会重新连接，按设置的缓存策略处理凭据。".into());
                             }
                         }
                         Err(error) => {
                             ui.set_history(format!("读取目录失败：{error}").into());
                             if is_remote {
+                                state.credentials.lock().unwrap().clear();
                                 ui.set_status("远程读取未完成，SSH 已断开；保留上次快照".into());
                             }
                         }
@@ -1305,6 +1397,7 @@ mod ui_tests {
                 windows_port: "22".into(),
                 windows_user: "home-user".into(),
                 windows_root: "C:/Users/home".into(),
+                ..Default::default()
             };
         }
         paint_remote_config(&ui, &state.borrow().remote_config);
@@ -1450,6 +1543,9 @@ mod ui_tests {
         assert_eq!(ui.get_setting_hops().row_count(), 0);
         paint_remote_config(&ui, &state.borrow().remote_config);
         snapshot(&ui, "remote-settings.png");
+        ui.window().set_size(slint::LogicalSize::new(920.0, 620.0));
+        snapshot(&ui, "remote-settings-small.png");
+        ui.window().set_size(slint::LogicalSize::new(1180.0, 800.0));
         ui.invoke_cancel_settings();
         ui.hide().unwrap();
     }

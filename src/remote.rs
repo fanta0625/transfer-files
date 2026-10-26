@@ -4,7 +4,11 @@ use std::{io, path::PathBuf, sync::atomic::AtomicBool};
 use zeroize::Zeroizing;
 
 #[cfg(any(target_os = "linux", test))]
+mod operations;
+#[cfg(all(test, windows))]
 mod protocol;
+#[cfg(any(target_os = "linux", test))]
+mod shell;
 #[cfg(target_os = "linux")]
 mod terminal;
 #[cfg(target_os = "linux")]
@@ -12,8 +16,18 @@ pub mod transfer;
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub enum Prompt {
-    Secret { hop: String },
-    HostKey { hop: String, details: String },
+    Secret {
+        hop: String,
+    },
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    KeyPassphrase {
+        hop: String,
+        key: String,
+    },
+    HostKey {
+        hop: String,
+        details: String,
+    },
 }
 
 pub type Answer = Option<Zeroizing<String>>;
@@ -34,25 +48,37 @@ pub fn file_name(path: &str) -> io::Result<String> {
 
 #[derive(Default)]
 pub struct CredentialCache {
-    entries: std::collections::HashMap<String, (Zeroizing<String>, std::time::Instant)>,
+    entries: std::collections::HashMap<String, (Zeroizing<String>, Option<std::time::Instant>)>,
+    policy: crate::config::CachePolicy,
 }
 impl CredentialCache {
+    pub fn set_policy(&mut self, policy: crate::config::CachePolicy) {
+        if self.policy != policy {
+            self.clear();
+            self.policy = policy;
+        }
+    }
     pub fn clear(&mut self) {
         self.entries.clear();
     }
-    pub fn get(&mut self, hop: &str) -> Option<Zeroizing<String>> {
+    pub fn expire(&mut self) {
         self.entries
-            .retain(|_, (_, expiry)| *expiry > std::time::Instant::now());
+            .retain(|_, (_, expiry)| expiry.is_none_or(|t| t > std::time::Instant::now()));
+    }
+    pub fn get(&mut self, hop: &str) -> Option<Zeroizing<String>> {
+        self.expire();
         self.entries.get(hop).map(|(value, _)| value.clone())
     }
     pub fn put(&mut self, hop: &str, value: Zeroizing<String>) {
-        self.entries.insert(
-            hop.into(),
-            (
-                value,
-                std::time::Instant::now() + std::time::Duration::from_secs(300),
-            ),
-        );
+        use crate::config::CachePolicy;
+        let expiry = match self.policy {
+            CachePolicy::Once => return,
+            CachePolicy::FiveMinutes => {
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(300))
+            }
+            CachePolicy::Session => None,
+        };
+        self.entries.insert(hop.into(), (value, expiry));
     }
 }
 
@@ -65,7 +91,7 @@ pub fn read_directory(
     config.validate().map_err(io::Error::other)?;
     if path.is_empty() || path.contains('\0') {
         return Err(io::Error::other(
-            "请输入 Windows 目录，例如 C:/Users/你的用户名",
+            "请输入远程目录，例如 /home/user 或 C:/Users/user",
         ));
     }
     #[cfg(target_os = "linux")]
@@ -79,6 +105,35 @@ pub fn read_directory(
             io::ErrorKind::Unsupported,
             "远程浏览目前只支持 Linux 客户端",
         ))
+    }
+}
+
+pub fn resolve_path_for(os: crate::config::RemoteOs, current: &str, requested: &str) -> PathBuf {
+    if os == crate::config::RemoteOs::Windows {
+        resolve_path(current, requested)
+    } else if requested.starts_with('/') {
+        requested.into()
+    } else {
+        PathBuf::from(current).join(requested)
+    }
+}
+pub fn parent_path_for(os: crate::config::RemoteOs, path: &str) -> Option<PathBuf> {
+    if os == crate::config::RemoteOs::Windows {
+        parent_path(path)
+    } else {
+        std::path::Path::new(path).parent().map(PathBuf::from)
+    }
+}
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn file_name_for(os: crate::config::RemoteOs, path: &str) -> io::Result<String> {
+    if os == crate::config::RemoteOs::Windows {
+        file_name(path)
+    } else {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .ok_or_else(|| io::Error::other("请选择文件或子目录"))
     }
 }
 
@@ -123,13 +178,41 @@ pub fn parent_path(path: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn cache_policies_and_linux_paths() {
+        use crate::config::{CachePolicy, RemoteOs};
+        let mut cache = CredentialCache::default();
+        cache.set_policy(CachePolicy::Once);
+        cache.put("node", Zeroizing::new("secret".into()));
+        assert!(cache.get("node").is_none());
+        cache.set_policy(CachePolicy::Session);
+        cache.put("node", Zeroizing::new("secret".into()));
+        assert!(cache.entries["node"].1.is_none());
+        assert!(cache.get("node").is_some());
+        cache.set_policy(CachePolicy::FiveMinutes);
+        assert!(cache.get("node").is_none());
+        cache.put("node", Zeroizing::new("secret".into()));
+        cache.entries.get_mut("node").unwrap().1 = Some(std::time::Instant::now());
+        cache.expire();
+        assert!(cache.entries.is_empty());
+        assert_eq!(
+            resolve_path_for(RemoteOs::Linux, "/home/u", "/etc"),
+            PathBuf::from("/etc")
+        );
+        assert_eq!(
+            resolve_path_for(RemoteOs::Linux, "/home/u", "docs"),
+            PathBuf::from("/home/u/docs")
+        );
+        assert!(parent_path_for(RemoteOs::Linux, "/").is_none());
+        assert_eq!(file_name_for(RemoteOs::Linux, "/tmp/a:b").unwrap(), "a:b");
+    }
+    #[test]
     fn cache_separates_nodes_and_expiration() {
         let mut cache = CredentialCache::default();
         cache.put("u@first:22", Zeroizing::new("first".into()));
         cache.put("u@second:22", Zeroizing::new("second".into()));
         assert_eq!(cache.get("u@first:22").unwrap().as_str(), "first");
         assert!(cache.get("u@first:2222").is_none());
-        cache.entries.get_mut("u@first:22").unwrap().1 = std::time::Instant::now();
+        cache.entries.get_mut("u@first:22").unwrap().1 = Some(std::time::Instant::now());
         assert!(cache.get("u@first:22").is_none());
         assert_eq!(cache.get("u@second:22").unwrap().as_str(), "second");
         cache.clear();

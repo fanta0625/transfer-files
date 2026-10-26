@@ -1,6 +1,6 @@
-import { Button, CheckBox, LineEdit, ProgressIndicator, ListView, TextEdit } from "std-widgets.slint";
+import { Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, ListView, ScrollView, TextEdit } from "std-widgets.slint";
 
-export struct HopRow { host: string, user: string, port: string }
+export struct HopRow { host: string, user: string, port: string, system: int, identity: string }
 
 export struct FileRow {
     name: string,
@@ -150,6 +150,9 @@ export component AppWindow inherits Window {
     in property <string> status: "准备就绪";
     in property <string> detail;
     in property <string> history;
+    in-out property <int> setting-target-system: 1;
+    in-out property <string> setting-target-identity;
+    in-out property <int> setting-cache-policy;
     in-out property <string> setting-route;
     in-out property <[HopRow]> setting-hops;
     callback change-hop(int, int);
@@ -198,7 +201,7 @@ export component AppWindow inherits Window {
             Button { text: root.remote-reading ? "读取中…" : "读取远程目录"; enabled: root.right-remote && !root.remote-reading && !root.busy; clicked => { root.refresh(1); } }
             Button { text: "远程设置"; enabled: !root.busy && !root.remote-reading; clicked => { root.show-settings(); } }
         }
-        Text { text: root.right-remote ? "远程模式 · 按配置链连接，完成后断开；支持文件和目录上传下载。" : "本地验证模式 · 两栏均为当前电脑目录。配置远程后可读取 Windows 目录。"; color: #526570; font-size: 13px; }
+        Text { text: root.right-remote ? "远程模式 · 按配置链连接，完成后断开；支持文件和目录上传下载。" : "本地验证模式 · 两栏均为当前电脑目录。配置远程后可读取 Windows / Linux 目录。"; color: #526570; font-size: 13px; }
         HorizontalLayout {
             spacing: 12px;
             left-pane := FilePane {
@@ -266,9 +269,9 @@ export component AppWindow inherits Window {
         background: #00000055;
         TouchArea { }
         Rectangle {
-            x: (root.width - 620px) / 2;
-            y: (root.height - 620px) / 2;
-            width: 620px; height: 620px;
+            x: (root.width - 820px) / 2;
+            y: (root.height - self.height) / 2;
+            width: 820px; height: min(700px, root.height - 32px);
             background: #ffffff;
             border-radius: 10px;
             border-width: 1px;
@@ -277,6 +280,10 @@ export component AppWindow inherits Window {
                 padding: 22px;
                 spacing: 10px;
                 Text { text: "远程连接设置"; color: #173b3d; font-size: 21px; font-weight: 700; }
+                ScrollView {
+                  content-width: self.visible-width;
+                  VerticalLayout {
+                    spacing: 10px;
                 Text {
                     text: "保存主机、端口、用户名和默认目录。密码不会写入配置文件，实际连接时再输入。";
                     color: #526570; font-size: 12px; wrap: word-wrap;
@@ -291,8 +298,10 @@ export component AppWindow inherits Window {
                     Text { text: "顺序 / 删除"; width: 120px; }
                 }
                 ListView {
-                    height: 110px;
-                    for hop[index] in root.setting-hops : HorizontalLayout {
+                    height: 145px;
+                    for hop[index] in root.setting-hops : VerticalLayout {
+                      spacing: 4px;
+                      HorizontalLayout {
                         spacing: 6px;
                         LineEdit { text <=> hop.host; placeholder-text: "example.com"; horizontal-stretch: 1; }
                         LineEdit { text <=> hop.user; placeholder-text: "user"; width: 110px; }
@@ -300,13 +309,19 @@ export component AppWindow inherits Window {
                         Button { text: "↑"; width: 36px; enabled: index > 0; clicked => { root.change-hop(2, index); } }
                         Button { text: "↓"; width: 36px; enabled: index + 1 < root.setting-hops.length; clicked => { root.change-hop(3, index); } }
                         Button { text: "×"; width: 36px; clicked => { root.change-hop(1, index); } }
+                      }
+                      HorizontalLayout {
+                        ComboBox { model: ["Linux", "Windows"]; current-index <=> hop.system; width: 120px; }
+                        Text { text: "私钥"; vertical-alignment: center; }
+                        LineEdit { text <=> hop.identity; placeholder-text: "连接发起端上的私钥路径，留空使用默认密钥 / 密码"; }
+                      }
                     }
                 }
                 HorizontalLayout {
                     Button { text: "添加一级中转"; enabled: root.setting-hops.length < 7; clicked => { root.change-hop(0, 0); } }
                     Button { text: "清空中转（直连）"; clicked => { root.change-hop(4, 0); } }
                 }
-                Text { text: root.setting-windows-host == "" ? "目标 SSH 主机（Windows）" : "目标 · " + root.setting-windows-host; color: #178477; font-size: 14px; font-weight: 700; }
+                Text { text: root.setting-windows-host == "" ? "目标 SSH 主机" : "目标 · " + root.setting-windows-host; color: #178477; font-size: 14px; font-weight: 700; }
                 HorizontalLayout {
                     spacing: 8px;
                     Text { text: "IP / 域名"; width: 76px; vertical-alignment: center; }
@@ -322,14 +337,25 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     Text { text: "默认目录"; width: 76px; vertical-alignment: center; }
-                    LineEdit { text <=> root.setting-windows-root; placeholder-text: "例如 C:/Users/你的用户名"; }
+                    LineEdit { text <=> root.setting-windows-root; placeholder-text: root.setting-target-system == 1 ? "例如 C:/Users/你的用户名" : "例如 /home/user"; }
+                }
+                HorizontalLayout {
+                    Text { text: "目标系统"; width: 76px; vertical-alignment: center; }
+                    ComboBox { model: ["Linux", "Windows"]; current-index <=> root.setting-target-system; width: 120px; }
+                    Text { text: "私钥"; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-target-identity; placeholder-text: "留空使用默认密钥 / 密码"; }
+                }
+                HorizontalLayout {
+                    Text { text: "密码缓存"; width: 76px; vertical-alignment: center; }
+                    ComboBox { model: ["5 分钟过期", "永不过期（退出程序清除）", "一次性（不缓存）"]; current-index <=> root.setting-cache-policy; }
                 }
                 Text {
-                    text: "最后一台为目标主机。支持直连或最多 7 级中转；读取目录仍需目标 Windows PowerShell。完成任务后断开。";
+                    text: "私钥须位于发起连接的上一台电脑，首节点使用本机私钥。Linux 需 Python 3；Windows 需 PowerShell。中断后重新选择相同源与目标即可校验续传。";
                     color: #8a5a20; font-size: 12px; wrap: word-wrap;
                 }
+                  }
+                }
                 Text { text: root.settings-error; color: #b32f2f; font-size: 12px; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }

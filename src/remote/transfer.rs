@@ -1,525 +1,553 @@
-//! Two ordinary SCP hops, with a private staging directory on the jump host.
-use super::{
-    Answer, Prompt,
-    terminal::{OPTIONS, quote, run_command},
-};
-use crate::config::RemoteConfig;
+//! Verified, resumable SFTP on each SSH edge, without TCP or agent forwarding.
+use super::{Answer, Prompt, operations, terminal};
+use crate::config::{RemoteConfig, RemoteOs, SshNode};
 use portable_pty::CommandBuilder;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     io,
     path::Path,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-fn token() -> String {
-    format!(
-        "tf-{}-{:x}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )
+#[derive(Clone, Debug)]
+struct Location {
+    node: Option<usize>,
+    path: String,
 }
-
-fn environment(c: &mut CommandBuilder) {
-    c.env("LC_ALL", "C");
-    c.env("SSH_ASKPASS_REQUIRE", "never");
-    c.env_remove("SSH_ASKPASS");
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Item {
+    path: String,
+    directory: bool,
+    size: u64,
+    hash: String,
 }
-
-fn endpoint(user: &str, host: &str, path: &str) -> String {
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
+struct Session<'a, F> {
+    nodes: Vec<SshNode>,
+    cancel: &'a AtomicBool,
+    ask: F,
+    token: String,
+}
+impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, F> {
+    fn rpc(&mut self, node: Option<usize>, request: Value) -> io::Result<Value> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "传输已取消"));
+        }
+        let mut cmd = if let Some(index) = node {
+            let script = operations::command(self.nodes[index].options.os, &request, &self.token);
+            terminal::chain_command(
+                &self.nodes[..=index],
+                &script,
+                &self.token,
+                request["op"] == "batch",
+            )
+        } else {
+            let mut cmd = CommandBuilder::new("python3");
+            cmd.args([
+                "-c",
+                &operations::script(RemoteOs::Linux, &request, &self.token),
+            ]);
+            cmd.env("LC_ALL", "C");
+            cmd.env("SSH_ASKPASS_REQUIRE", "never");
+            cmd
+        };
+        let mut sequence: Vec<String> = node
+            .map(|i| self.nodes[1..=i].iter().map(SshNode::label).collect())
+            .unwrap_or_default();
+        if let Some(label) = request["auth_node"].as_str() {
+            sequence.push(label.into());
+        }
+        cmd.env(
+            "TF_AUTH_SEQUENCE",
+            serde_json::to_string(&sequence).unwrap(),
+        );
+        // Large-file hashing may be silent; cancellation is still polled every 50ms.
+        let output = terminal::run_command(
+            cmd,
+            &self.token,
+            self.cancel,
+            &mut self.ask,
+            Duration::from_secs(1800),
+        )?;
+        operations::parse(&output, &self.token)
+    }
+    fn manifest(&mut self, location: &Location) -> io::Result<Vec<Item>> {
+        let value = self.rpc(
+            location.node,
+            json!({"op":"manifest", "path":location.path}),
+        )?;
+        let mut items: Vec<Item> = serde_json::from_value(value).map_err(io::Error::other)?;
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        if items.first().is_none_or(|i| !i.path.is_empty()) {
+            return Err(io::Error::other("无效的源文件清单"));
+        }
+        for item in &items {
+            if !item.path.is_empty() {
+                for component in item.path.split('/') {
+                    valid_name(component)?;
+                }
+            }
+        }
+        Ok(items)
+    }
+    fn hash(&mut self, location: &Location, limit: Option<u64>) -> io::Result<Value> {
+        self.rpc(
+            location.node,
+            json!({"op":"hash", "path":location.path, "limit":limit}),
+        )
+    }
+    fn batch(&mut self, runner: Option<usize>, remote: usize, batch: &str) -> io::Result<()> {
+        let node = &self.nodes[remote];
+        let mut args: Vec<String> = terminal::OPTIONS.iter().map(|v| v.to_string()).collect();
+        args.extend(terminal::identity_args(node));
+        args.extend([
+            "-P".into(),
+            node.port.clone(),
+            "-o".into(),
+            format!("User={}", node.user),
+        ]);
+        let host = if node.host.contains(':') && !node.host.starts_with('[') {
+            format!("[{}]", node.host)
+        } else {
+            node.host.clone()
+        };
+        self.rpc(runner, json!({"op":"batch", "args":args, "host":host, "batch":batch, "marker":terminal::marker(node, &self.token), "auth_node":node.label()}))?;
+        Ok(())
+    }
+    fn edge(&mut self, source: &Location, target: &Location, items: &[Item]) -> io::Result<()> {
+        let download = match (source.node, target.node) {
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => a > b,
+            _ => return Err(io::Error::other("无效的 SSH 传输路径")),
+        };
+        let (runner, remote) = if download {
+            (target.node, source.node.unwrap())
+        } else {
+            (source.node, target.node.unwrap())
+        };
+        let mut batch = String::new();
+        for item in items {
+            let src = Location {
+                node: source.node,
+                path: join(&source.path, &item.path),
+            };
+            let dst = Location {
+                node: target.node,
+                path: join(&target.path, &item.path),
+            };
+            if item.directory {
+                self.rpc(dst.node, json!({"op":"mkdir", "path":dst.path}))?;
+                continue;
+            }
+            let existing = self.hash(&dst, None)?;
+            let mut resume = false;
+            if !existing.is_null() {
+                let size = existing["size"]
+                    .as_u64()
+                    .ok_or_else(|| io::Error::other("无效的续传大小"))?;
+                if size > item.size {
+                    return Err(io::Error::other(
+                        "暂存文件大于源文件；请清理该任务暂存后重试",
+                    ));
+                }
+                let prefix = self.hash(&src, Some(size))?;
+                if prefix != existing {
+                    return Err(io::Error::other(
+                        "续传前缀 SHA-256 不匹配，已停止；请清理该任务暂存后重试",
+                    ));
+                }
+                if size == item.size && existing["hash"] == item.hash {
+                    continue;
+                }
+                resume = true;
+            }
+            let operation = match (download, resume) {
+                (true, true) => "reget",
+                (true, false) => "get",
+                (false, true) => "reput",
+                (false, false) => "put",
+            };
+            batch.push_str(&format!(
+                "{operation} {} {}\n",
+                sftp_quote(&src.path)?,
+                sftp_quote(&dst.path)?
+            ));
+            if batch.len() >= 2048 {
+                self.batch(runner, remote, &batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.batch(runner, remote, &batch)?;
+        }
+        if self.manifest(target)? != items {
+            return Err(io::Error::other(
+                "传输后 SHA-256 或目录清单不一致，未发布目标",
+            ));
+        }
+        Ok(())
+    }
+}
+fn valid_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(io::Error::other("文件名包含不支持的分隔符或控制字符"));
+    }
+    Ok(())
+}
+fn join(base: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        base.into()
     } else {
-        host.to_string()
-    };
-    format!("{user}@{host}:{path}")
+        format!("{}/{}", base.trim_end_matches('/'), relative)
+    }
 }
-
-fn scp_args(port: &str, source: &str, target: &str) -> Vec<String> {
-    let mut args = vec!["-r".into()];
-    args.extend(OPTIONS.iter().map(|v| v.to_string()));
-    args.extend([
-        "-P".into(),
-        port.into(),
-        "--".into(),
-        source.into(),
-        target.into(),
-    ]);
-    args
-}
-
-fn local_scp_node(
-    node: &crate::config::SshNode,
-    local: &Path,
-    remote_path: &str,
-    download: bool,
-) -> CommandBuilder {
-    let remote = endpoint(&node.user, &node.host, remote_path);
-    let local = local.to_string_lossy();
-    let (source, target) = if download {
-        (remote.as_str(), local.as_ref())
+fn parent(path: &str) -> io::Result<&str> {
+    let (parent, _) = path
+        .rsplit_once('/')
+        .ok_or_else(|| io::Error::other("请使用绝对目标路径"))?;
+    Ok(if parent.is_empty() {
+        "/"
+    } else if parent.len() == 2 && parent.ends_with(':') {
+        &path[..3]
     } else {
-        (local.as_ref(), remote.as_str())
-    };
-    let mut c = CommandBuilder::new("scp");
-    c.args(scp_args(&node.port, source, target));
-    environment(&mut c);
-    c.env("TF_NODE_LABEL", node.label());
-    c
+        parent
+    })
 }
-fn edge_scp(
-    nodes: &[crate::config::SshNode],
-    index: usize,
-    remote_path: &str,
-    staging: &str,
-    id: &str,
-    download: bool,
-) -> CommandBuilder {
-    let next = &nodes[index + 1];
-    let remote = endpoint(&next.user, &next.host, remote_path);
-    let (source, target) = if download {
-        (remote.as_str(), staging)
-    } else {
-        (staging, remote.as_str())
-    };
-    let script = format!(
-        "stty -echo; printf '%s\\n' {}; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never scp {}",
-        quote(&super::terminal::marker(next, id)),
-        scp_args(&next.port, source, target)
-            .iter()
-            .map(|v| quote(v))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    super::terminal::chain_command(&nodes[..=index], &script, id, true)
-}
-#[cfg(test)]
-fn nested_scp(
-    config: &RemoteConfig,
-    windows: &str,
-    staging: &str,
-    id: &str,
-    download: bool,
-) -> CommandBuilder {
-    edge_scp(
-        &config.nodes().unwrap(),
-        0,
-        &windows.replace('\\', "/"),
-        staging,
-        id,
-        download,
-    )
+fn sftp_quote(path: &str) -> io::Result<String> {
+    if path.chars().any(char::is_control) {
+        return Err(io::Error::other("SFTP 路径不能包含控制字符"));
+    }
+    let mut escaped = String::from("\"");
+    for c in path.chars() {
+        if matches!(c, '\\' | '"') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped.push('"');
+    Ok(escaped)
 }
 fn transfer(
     config: &RemoteConfig,
     local: &Path,
-    windows: &str,
+    remote: &str,
     download: bool,
-    mut execute: impl FnMut(CommandBuilder, &str) -> io::Result<String>,
+    cancel: &AtomicBool,
+    ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
     config.validate().map_err(io::Error::other)?;
     let nodes = config.nodes().map_err(io::Error::other)?;
-    let id = token();
-    let windows = windows.replace('\\', "/");
-    if nodes.len() == 1 {
-        execute(local_scp_node(&nodes[0], local, &windows, download), &id)?;
-        return Ok(());
-    }
-    let directory = format!("/tmp/transfer-files-{id}");
-    let payload = format!("{directory}/payload");
-    let intermediates = nodes.len() - 1;
-    for index in 0..intermediates {
-        let cmd = super::terminal::chain_command(
-            &nodes[..=index],
-            &format!("umask 077; mkdir -- {}", quote(&directory)),
-            &id,
-            true,
-        );
-        execute(cmd, &id).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "{} 创建暂存目录失败：{e}；此前节点可能保留 {directory}",
-                    nodes[index].label()
-                ),
-            )
-        })?;
-    }
-    let mut stages = Vec::new();
-    if !download {
-        stages.push((
-            local_scp_node(&nodes[0], local, &payload, false),
-            format!("本地 → {}", nodes[0].label()),
-        ));
-    }
-    let indices: Vec<_> = if download {
-        (0..intermediates).rev().collect()
+    let last = nodes.len() - 1;
+    let remote = if config.target_options.os == RemoteOs::Windows {
+        remote.replace('\\', "/")
     } else {
-        (0..intermediates).collect()
+        remote.into()
     };
-    for index in indices {
-        let remote_path = if index == intermediates - 1 {
-            &windows
-        } else {
-            &payload
-        };
-        let stage = if download {
-            format!("{} → {}", nodes[index + 1].label(), nodes[index].label())
-        } else {
-            format!("{} → {}", nodes[index].label(), nodes[index + 1].label())
-        };
-        stages.push((
-            edge_scp(&nodes, index, remote_path, &payload, &id, download),
-            stage,
+    let local = local
+        .to_str()
+        .ok_or_else(|| io::Error::other("仅支持 UTF-8 路径"))?
+        .to_string();
+    let local = Location {
+        node: None,
+        path: local,
+    };
+    let remote = Location {
+        node: Some(last),
+        path: remote,
+    };
+    let (source, destination) = if download {
+        (remote, local)
+    } else {
+        (local, remote)
+    };
+    let token = format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let mut session = Session {
+        nodes,
+        cancel,
+        ask,
+        token,
+    };
+    let items = session.manifest(&source)?;
+    if session.rpc(
+        destination.node,
+        json!({"op":"exists", "path":destination.path}),
+    )? == true
+    {
+        if session.manifest(&destination)? == items {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "目标已存在且内容不同；不会覆盖或合并，请更换目标目录",
         ));
     }
-    if download {
-        stages.push((
-            local_scp_node(&nodes[0], local, &payload, true),
-            format!("{} → 本地", nodes[0].label()),
-        ));
-    }
-    for (cmd, stage) in stages {
-        execute(cmd, &id).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("{stage} 失败：{e}；中转节点可能保留 {directory}"),
-            )
-        })?;
-    }
-    for index in (0..intermediates).rev() {
-        let cmd = super::terminal::chain_command(
-            &nodes[..=index],
-            &format!("rm -rf -- {}", quote(&directory)),
-            &id,
-            true,
-        );
-        execute(cmd, &id).map_err(|e| {
-            io::Error::new(
-                e.kind(),
+    // Content + route + endpoints identify an interrupted task even after restart.
+    let id = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({
+        "version":1, "source":source.path, "destination":destination.path, "download":download,
+        "nodes":session.nodes.iter().map(|n| (n.label(), n.options.os)).collect::<Vec<_>>(), "items":items
+    })).unwrap()));
+    let order: Vec<Option<usize>> = if download {
+        (0..last).rev().map(Some).chain([None]).collect()
+    } else {
+        (0..=last).map(Some).collect()
+    };
+    let mut staging = Vec::new();
+    let result: io::Result<()> = (|| {
+        let mut previous = source;
+        for node in order {
+            let base = if node == destination.node {
+                Some(parent(&destination.path)?)
+            } else {
+                None
+            };
+            let value = session.rpc(node, json!({"op":"prepare", "base":base, "id":id}))?;
+            let directory = value
+                .as_str()
+                .ok_or_else(|| io::Error::other("无效的暂存目录"))?
+                .to_string();
+            staging.push(Location {
+                node,
+                path: directory.clone(),
+            });
+            let next = Location {
+                node,
+                path: join(&directory, "payload"),
+            };
+            session.edge(&previous, &next, &items)?;
+            previous = next;
+        }
+        session.rpc(
+            destination.node,
+            json!({"op":"publish", "source":previous.path, "target":destination.path}),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let paths = staging
+            .iter()
+            .map(|l| {
                 format!(
-                    "传输完成，但 {} 暂存清理失败：{directory}；{e}",
-                    nodes[index].label()
-                ),
-            )
-        })?;
+                    "{}: {}",
+                    l.node
+                        .map(|i| session.nodes[i].label())
+                        .unwrap_or("本地".into()),
+                    l.path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{error}；再次选择相同源和目标即可校验续传。保留暂存：{paths}"),
+        ));
+    }
+    for location in staging.iter().rev() {
+        session
+            .rpc(location.node, json!({"op":"remove", "path":location.path}))
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "文件已送达，但暂存清理未完成：{}；{e}",
+                    location.path
+                ))
+            })?;
     }
     Ok(())
 }
-
 pub fn upload(
     config: &RemoteConfig,
     source: &Path,
     target_dir: &str,
     cancel: &AtomicBool,
-    mut ask: impl FnMut(Prompt) -> io::Result<Answer>,
+    ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
-    let source = source.canonicalize()?;
+    let source = std::path::absolute(source)?;
     let name = source
         .file_name()
-        .ok_or_else(|| io::Error::other("源路径没有文件名"))?
-        .to_string_lossy();
-    let target = format!(
-        "{}/{}",
-        target_dir.replace('\\', "/").trim_end_matches('/'),
-        name
-    );
-    transfer(config, &source, &target, false, |cmd, id| {
-        run_command(cmd, id, cancel, &mut ask, Duration::from_secs(60))
-    })
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::other("源路径没有有效文件名"))?;
+    valid_name(name)?;
+    let target_dir = if config.target_options.os == RemoteOs::Windows {
+        target_dir.replace('\\', "/")
+    } else {
+        target_dir.into()
+    };
+    transfer(
+        config,
+        &source,
+        &join(&target_dir, name),
+        false,
+        cancel,
+        ask,
+    )
 }
-
 pub fn download(
     config: &RemoteConfig,
     source: &str,
     name: &str,
     target_dir: &Path,
     cancel: &AtomicBool,
-    mut ask: impl FnMut(Prompt) -> io::Result<Answer>,
+    ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-        return Err(io::Error::other("无效的远程文件名"));
-    }
-    let target = target_dir.canonicalize()?.join(name);
-    // Do not let SCP overwrite existing local files or merge directories.
-    if target.symlink_metadata().is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "本地存在同名项目，请更换目标目录",
-        ));
-    }
-    transfer(config, &target, source, true, |cmd, id| {
-        run_command(cmd, id, cancel, &mut ask, Duration::from_secs(60))
-    })
+    valid_name(name)?;
+    transfer(
+        config,
+        &std::path::absolute(target_dir)?.join(name),
+        source,
+        true,
+        cancel,
+        ask,
+    )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn direct_and_recursive_transfer_plans_use_every_node_in_order() {
-        for download in [true, false] {
-            for count in [1, 2, 4] {
-                let mut config = config();
-                config.route = Some(
+    fn rejects_traversal_and_batch_injection() {
+        for name in ["", ".", "..", "../x", "x\\y", "x\nput secret"] {
+            assert!(valid_name(name).is_err());
+        }
+        assert!(sftp_quote("a\n!echo bad").is_err());
+        assert_eq!(sftp_quote("/tmp/a b\"c").unwrap(), "\"/tmp/a b\\\"c\"");
+    }
+
+    /// Run using scripts/test-transfer.sh, with real SFTP and a local SSH transport fixture.
+    #[test]
+    #[ignore = "requires isolated SSH fixture and an OpenSSH sftp-server executable"]
+    fn real_sftp_resume_and_multihop_roundtrip() {
+        assert!(std::env::var_os("TF_TEST_SFTP_SERVER").is_some());
+        let temp = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        for count in [1, 2, 4] {
+            let config = RemoteConfig {
+                route: Some(
                     (0..count - 1)
-                        .map(|i| format!("hop{i}.test {} user{i}", 2200 + i))
+                        .map(|i| format!("hop{i}.test 22 user"))
                         .collect::<Vec<_>>()
                         .join("\n"),
-                );
-                let mut calls = Vec::new();
+                ),
+                windows_host: "target.test".into(),
+                windows_port: "22".into(),
+                windows_user: "user".into(),
+                windows_root: temp.path().display().to_string(),
+                target_options: crate::config::NodeOptions::linux(),
+                ..Default::default()
+            };
+            let source = temp.path().join(format!("source-{count}"));
+            let remote = temp.path().join(format!("remote-{count}"));
+            let downloaded = temp.path().join(format!("downloaded-{count}"));
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(source.join("空目录")).unwrap();
+            std::fs::write(source.join("a [b]*? ' \"文件.txt"), b"abcdef").unwrap();
+            std::fs::write(source.join("empty.txt"), b"").unwrap();
+            let ask = |_| panic!("Unexpected authentication in transport fixture");
+            transfer(
+                &config,
+                &source,
+                remote.to_str().unwrap(),
+                false,
+                &cancel,
+                ask,
+            )
+            .unwrap();
+            transfer(
+                &config,
+                &downloaded,
+                remote.to_str().unwrap(),
+                true,
+                &cancel,
+                ask,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(downloaded.join("a [b]*? ' \"文件.txt")).unwrap(),
+                b"abcdef"
+            );
+            assert!(downloaded.join("空目录").is_dir());
+            std::fs::write(downloaded.join("empty.txt"), "keep").unwrap();
+            assert!(
                 transfer(
                     &config,
-                    Path::new("/tmp/item"),
-                    "C:/item",
-                    download,
-                    |cmd, _| {
-                        calls.push(cmd.get_argv().clone());
-                        Ok(String::new())
-                    },
+                    &downloaded,
+                    remote.to_str().unwrap(),
+                    true,
+                    &cancel,
+                    ask
                 )
-                .unwrap();
-                if count == 1 {
-                    assert_eq!(calls.len(), 1);
-                    assert_eq!(calls[0][0], "scp");
-                    let remote = endpoint(&config.windows_user, &config.windows_host, "C:/item");
-                    assert_eq!(
-                        calls[0][calls[0].len() - if download { 2 } else { 1 }],
-                        remote.as_str()
-                    );
-                } else {
-                    assert_eq!(calls.len(), count + 2 * (count - 1));
-                    // Every edge transfers exactly once. The outer SCP is first
-                    // when uploading and last when downloading.
-                    let first_transfer = count - 1;
-                    let local_index = first_transfer + if download { count - 1 } else { 0 };
-                    assert_eq!(calls[local_index][0], "scp");
-                    assert!(
-                        calls[first_transfer..first_transfer + count]
-                            .iter()
-                            .all(|args| !args.last().unwrap().to_string_lossy().contains("rm -rf"))
-                    );
-                }
-            }
-        }
-    }
-
-    fn config() -> RemoteConfig {
-        RemoteConfig {
-            route: None,
-            jump_host: "jump.test".into(),
-            jump_port: "2201".into(),
-            jump_user: "alice".into(),
-            windows_host: "100.64.0.2".into(),
-            windows_port: "2202".into(),
-            windows_user: "home user".into(),
-            windows_root: "C:/Users/home".into(),
-        }
-    }
-
-    #[test]
-    fn nested_commands_execute_with_correct_direction_ports_and_literal_paths() {
-        let config = config();
-        for download in [true, false] {
-            let cmd = nested_scp(
-                &config,
-                r"C:\Users\home\资料 ' $(exit 81).txt",
-                "/tmp/stage/payload",
-                "test",
-                download,
+                .is_err()
             );
-            let remote_script = cmd.get_argv().last().unwrap().to_str().unwrap();
-            // A real shell and a fake scp executable: the old exec 'scp ...'
-            // fails here, as does reversed direction or broken argument quoting.
-            let temp = tempfile::tempdir().unwrap();
-            let executable = temp.path().join("scp");
-            std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let output = std::process::Command::new("sh")
-                .args(["-c", remote_script])
-                .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{:?}", output);
-            let stdout = String::from_utf8(output.stdout).unwrap();
-            let marker = format!(
-                "{}\n",
-                super::super::terminal::marker(&config.nodes().unwrap()[1], "test")
-            );
-            assert!(stdout.starts_with(&marker));
-            let args = stdout
-                .trim_start_matches(&marker)
-                .split('\0')
-                .collect::<Vec<_>>();
-            assert!(args.windows(2).any(|v| v == ["-P", "2202"]));
-            let endpoints = &args[args.len() - 3..args.len() - 1];
-            let windows = "home user@100.64.0.2:C:/Users/home/资料 ' $(exit 81).txt";
             assert_eq!(
-                endpoints,
-                if download {
-                    [windows, "/tmp/stage/payload"]
-                } else {
-                    ["/tmp/stage/payload", windows]
-                }
+                std::fs::read(downloaded.join("empty.txt")).unwrap(),
+                b"keep"
             );
-            assert!(!remote_script.contains("rm -rf"));
-        }
-    }
 
-    #[test]
-    fn both_hops_complete_before_cleanup_and_failures_keep_staging() {
-        for download in [true, false] {
-            for fail_at in [None, Some(1), Some(2)] {
-                let mut calls = Vec::new();
-                let result = transfer(
-                    &config(),
-                    Path::new("/tmp/local item"),
-                    "C:/文件.txt",
-                    download,
-                    |cmd, _| {
-                        calls.push(cmd.get_argv().clone());
-                        if Some(calls.len() - 1) == fail_at {
-                            Err(io::Error::other("simulated failure"))
-                        } else {
-                            Ok(String::new())
-                        }
-                    },
-                );
-                assert_eq!(result.is_ok(), fail_at.is_none());
-                assert!(
-                    calls[0]
-                        .last()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .starts_with("umask 077; mkdir -- ")
-                );
-                if let Some(index) = fail_at {
-                    assert_eq!(calls.len(), index + 1);
-                    assert!(
-                        !calls.iter().any(|a| a
-                            .last()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()
-                            .starts_with("rm "))
-                    );
-                } else {
-                    assert_eq!(calls.len(), 4);
-                    assert!(
-                        calls[3]
-                            .last()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()
-                            .starts_with("rm -rf -- '/tmp/transfer-files-tf-")
-                    );
-                    let local = &calls[if download { 2 } else { 1 }];
-                    assert!(local.windows(2).any(|v| v[0] == "-P" && v[1] == "2201"));
-                    assert_eq!(
-                        local[local.len() - if download { 1 } else { 2 }],
-                        "/tmp/local item"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn file_and_directory_roundtrip_through_real_shell_and_staging() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let windows = temp.path().join("windows");
-        let local = temp.path().join("local");
-        let bin = temp.path().join("bin");
-        for dir in [&windows, &local, &bin] {
-            std::fs::create_dir(dir).unwrap();
-        }
-        // Replace network transport only. Execute the generated shell commands
-        // and copy actual bytes/trees, including the real staging cleanup.
-        for (name, script) in [
-            (
-                "ssh",
-                "#!/usr/bin/python3\nimport os,sys\nos.execv('/bin/sh', ['sh','-c',sys.argv[-1]])\n",
-            ),
-            (
-                "scp",
-                r#"#!/usr/bin/python3
-import os,sys,shutil
-def path(value):
-    if '@' in value and ':' in value:
-        host, value = value.split(':', 1)
-        if '100.64.0.2' in host:
-            assert value.startswith('C:/')
-            value = os.path.join(os.environ['TF_TEST_WINDOWS'], value[3:])
-    return value
-src,dst = map(path, sys.argv[-2:])
-assert os.path.exists(src), src
-assert not os.path.exists(dst), dst
-if os.path.isdir(src): shutil.copytree(src,dst)
-else: shutil.copyfile(src,dst)
-"#,
-            ),
-        ] {
-            let path = bin.join(name);
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        for directory in [false, true] {
-            let name = if directory {
-                "目录 ' 空格"
-            } else {
-                "文件 ' 空格.txt"
+            let nodes = config.nodes().unwrap();
+            let mut session = Session {
+                nodes,
+                cancel: &cancel,
+                ask,
+                token: "resume-test".into(),
             };
-            let source = local.join(name);
-            if directory {
-                std::fs::create_dir_all(source.join("空目录")).unwrap();
-                std::fs::write(source.join("内容.txt"), "往返内容").unwrap();
-            } else {
-                std::fs::write(&source, "往返内容").unwrap();
-            }
-            let remote = format!("C:/{name}");
-            let destination = local.join(format!("下载-{name}"));
-            let mut staging = Vec::new();
-            for (download, local_path) in [(false, &source), (true, &destination)] {
-                transfer(&config(), local_path, &remote, download, |mut cmd, id| {
-                    let program = cmd.get_argv()[0].clone();
-                    cmd.get_argv_mut()[0] = bin.join(program).into_os_string();
-                    cmd.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
-                    cmd.env("TF_TEST_WINDOWS", &windows);
-                    staging.push(format!("/tmp/transfer-files-{id}"));
-                    run_command(
-                        cmd,
-                        id,
-                        &AtomicBool::new(false),
-                        |_| panic!("unexpected authentication"),
-                        Duration::from_secs(5),
-                    )
-                })
-                .unwrap();
-            }
-            let downloaded_file = if directory {
-                destination.join("内容.txt")
-            } else {
-                destination.clone()
+            let src = Location {
+                node: None,
+                path: source.join("a [b]*? ' \"文件.txt").display().to_string(),
             };
-            assert_eq!(
-                std::fs::read(downloaded_file).unwrap(),
-                "往返内容".as_bytes()
-            );
-            if directory {
-                assert!(destination.join("空目录").is_dir());
-            }
-            assert!(source.exists(), "source must be preserved");
+            let dst = Location {
+                node: Some(0),
+                path: temp
+                    .path()
+                    .join(format!("partial-{count}"))
+                    .display()
+                    .to_string(),
+            };
+            let items = session.manifest(&src).unwrap();
+            std::fs::write(&dst.path, b"abc").unwrap();
+            session.edge(&src, &dst, &items).unwrap();
+            assert_eq!(std::fs::read(&dst.path).unwrap(), b"abcdef");
+            // Reverse direction uses reget, and validates its prefix too.
+            let receive = Location {
+                node: None,
+                path: temp
+                    .path()
+                    .join(format!("receive-{count}"))
+                    .display()
+                    .to_string(),
+            };
+            std::fs::write(&receive.path, b"ab").unwrap();
+            session.edge(&dst, &receive, &items).unwrap();
+            assert_eq!(std::fs::read(&receive.path).unwrap(), b"abcdef");
+            std::fs::write(&dst.path, b"BAD").unwrap();
             assert!(
-                windows.join(name).exists(),
-                "Windows source must be preserved"
+                session
+                    .edge(&src, &dst, &items)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SHA-256")
             );
-            assert!(staging.iter().all(|path| !Path::new(path).exists()));
+            assert_eq!(std::fs::read(&dst.path).unwrap(), b"BAD");
+            let link = temp.path().join(format!("link-{count}"));
+            std::os::unix::fs::symlink(&src.path, &link).unwrap();
+            assert!(
+                session
+                    .manifest(&Location {
+                        node: None,
+                        path: link.display().to_string()
+                    })
+                    .is_err()
+            );
         }
     }
 }

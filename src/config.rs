@@ -3,9 +3,67 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOs {
+    Linux,
+    #[default]
+    Windows,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeOptions {
+    pub os: RemoteOs,
+    /// On the computer initiating this SSH connection, never copied between nodes.
+    pub identity_file: String,
+}
+impl NodeOptions {
+    pub fn linux() -> Self {
+        Self {
+            os: RemoteOs::Linux,
+            identity_file: String::new(),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    Once,
+    #[default]
+    FiveMinutes,
+    Session,
+}
+impl CachePolicy {
+    pub fn index(self) -> i32 {
+        match self {
+            Self::FiveMinutes => 0,
+            Self::Session => 1,
+            Self::Once => 2,
+        }
+    }
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Session,
+            2 => Self::Once,
+            _ => Self::FiveMinutes,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Once => "一次性（不缓存）",
+            Self::FiveMinutes => "5 分钟过期",
+            Self::Session => "永不过期（退出程序清除）",
+        }
+    }
+}
+
 /// Persistent connection settings. Passwords and private key contents are intentionally absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteConfig {
+    pub hop_options: Vec<NodeOptions>,
+    pub target_options: NodeOptions,
+    pub cache_policy: CachePolicy,
     /// Ordered intermediate SSH nodes. None migrates the legacy jump fields.
     pub route: Option<String>,
     pub jump_host: String,
@@ -37,6 +95,7 @@ impl RemoteConfig {
                 host: self.jump_host.clone(),
                 port: self.jump_port.clone(),
                 user: self.jump_user.clone(),
+                ..Default::default()
             }])
         }
     }
@@ -47,8 +106,18 @@ impl RemoteConfig {
             host: self.windows_host.clone(),
             port: self.windows_port.clone(),
             user: self.windows_user.clone(),
+            ..Default::default()
         });
-        for node in &nodes {
+        let last = nodes.len() - 1;
+        for (index, node) in nodes.iter_mut().enumerate() {
+            node.options = if index == last {
+                self.target_options.clone()
+            } else {
+                self.hop_options
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(NodeOptions::linux)
+            };
             node.validate()?;
         }
         if nodes.len() > 8 {
@@ -119,6 +188,18 @@ impl RemoteConfig {
             };
             let value = value.trim().to_string();
             match key.trim() {
+                "credential_ttl" => {
+                    config.cache_policy = CachePolicy::from_index(value.parse().unwrap_or(0))
+                }
+                "node_options" => {
+                    if let Ok(bytes) = STANDARD.decode(&value)
+                        && let Ok((hops, target)) =
+                            serde_json::from_slice::<(Vec<NodeOptions>, NodeOptions)>(&bytes)
+                    {
+                        config.hop_options = hops;
+                        config.target_options = target;
+                    }
+                }
                 "route" => config.route = Some(value.replace('|', "\n")),
                 "jump_host" => config.jump_host = value,
                 "jump_port" => config.jump_port = value,
@@ -149,12 +230,19 @@ impl RemoteConfig {
         if let Some(route) = &self.route {
             contents.push_str(&format!("route={}\n", route.replace('\n', "|")));
         }
+        contents.push_str(&format!(
+            "credential_ttl={}\nnode_options={}\n",
+            self.cache_policy.index(),
+            STANDARD
+                .encode(serde_json::to_vec(&(&self.hop_options, &self.target_options)).unwrap())
+        ));
         contents
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SshNode {
+    pub options: NodeOptions,
     pub host: String,
     pub port: String,
     pub user: String,
@@ -170,6 +258,7 @@ impl SshNode {
                 host: host.into(),
                 port: port.into(),
                 user: user.trim().into(),
+                options: NodeOptions::linux(),
             };
             node.validate()?;
             return Ok(node);
@@ -204,6 +293,7 @@ impl SshNode {
             host: host.into(),
             port: port.unwrap_or("22").into(),
             user: user.into(),
+            options: NodeOptions::linux(),
         };
         node.validate()?;
         Ok(node)
@@ -214,6 +304,9 @@ impl SshNode {
         format!("{}@{}:{}", self.user, self.host, self.port)
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.options.identity_file.chars().any(char::is_control) {
+            return Err("私钥路径不能包含控制字符".into());
+        }
         if self.host.is_empty()
             || self.host.starts_with('-')
             || self
@@ -258,6 +351,31 @@ fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::RemoteConfig;
+    #[test]
+    fn mixed_systems_keys_and_cache_policy_roundtrip() {
+        use super::{CachePolicy, NodeOptions, RemoteOs};
+        let mut config = RemoteConfig::from_contents(
+            "route=hop 22 user\nwindows_host=target\nwindows_port=22\nwindows_user=user\nwindows_root=/home/user\n",
+        );
+        config.hop_options = vec![NodeOptions {
+            os: RemoteOs::Windows,
+            identity_file: "/home/me/密钥 key".into(),
+        }];
+        config.target_options = NodeOptions {
+            os: RemoteOs::Linux,
+            identity_file: "C:/Users/me/.ssh/id_ed25519".into(),
+        };
+        config.cache_policy = CachePolicy::Session;
+        let loaded = RemoteConfig::from_contents(&config.to_contents());
+        assert_eq!(config, loaded);
+        let nodes = loaded.nodes().unwrap();
+        assert_eq!(nodes[0].options.os, RemoteOs::Windows);
+        assert_eq!(nodes[1].options.os, RemoteOs::Linux);
+        assert_eq!(
+            nodes[1].options.identity_file,
+            "C:/Users/me/.ssh/id_ed25519"
+        );
+    }
     #[test]
     fn ssh_style_routes_and_invalid_arguments() {
         for line in [
@@ -344,6 +462,7 @@ mod tests {
             windows_port: "22".into(),
             windows_user: "bob".into(),
             windows_root: "C:/Users/bob".into(),
+            ..Default::default()
         };
         assert!(config.validate().is_ok());
         config.windows_port = "0".into();

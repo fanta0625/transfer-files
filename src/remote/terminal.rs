@@ -1,6 +1,8 @@
 //! PTY adapter: OpenSSH reads passwords from a controlling terminal, never argv.
-use super::{Answer, Listing, Prompt, protocol};
-use crate::config::RemoteConfig;
+use super::shell::invoke;
+pub(crate) use super::shell::{identity_args, quote};
+use super::{Answer, Listing, Prompt};
+use crate::config::{RemoteConfig, SshNode};
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
     io::{self, Read, Write},
@@ -49,8 +51,46 @@ pub(crate) const OPTIONS: &[&str] = &[
 ];
 const LIMIT: usize = 16 * 1024 * 1024;
 
-pub(crate) fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// ConPTY on Windows hops adds CSI/OSC sequences, sometimes across read boundaries.
+#[derive(Default)]
+struct TerminalText {
+    escape: u8,
+}
+impl TerminalText {
+    fn push(&mut self, input: &[u8]) -> String {
+        let mut plain = Vec::with_capacity(input.len());
+        for &byte in input {
+            match self.escape {
+                0 if byte == 27 => self.escape = 1,
+                0 => {
+                    if byte >= 32 || matches!(byte, b'\r' | b'\n' | b'\t') {
+                        plain.push(byte);
+                    }
+                }
+                1 => {
+                    self.escape = match byte {
+                        b'[' => 2,
+                        b']' => 3,
+                        _ => 0,
+                    }
+                }
+                2 => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        self.escape = 0;
+                    }
+                }
+                3 => {
+                    if byte == 7 {
+                        self.escape = 0;
+                    } else if byte == 27 {
+                        self.escape = 4;
+                    }
+                }
+                _ => self.escape = if byte == b'\\' { 0 } else { 3 },
+            }
+        }
+        String::from_utf8_lossy(&plain).into_owned()
+    }
 }
 
 pub(crate) fn marker(node: &crate::config::SshNode, token: &str) -> String {
@@ -61,7 +101,7 @@ pub(crate) fn marker(node: &crate::config::SshNode, token: &str) -> String {
     )
 }
 pub(crate) fn chain_command(
-    nodes: &[crate::config::SshNode],
+    nodes: &[SshNode],
     script: &str,
     token: &str,
     tty: bool,
@@ -71,7 +111,7 @@ pub(crate) fn chain_command(
     for index in (1..nodes.len()).rev() {
         let node = &nodes[index];
         let mut args = vec![
-            "ssh".to_string(),
+            "ssh".into(),
             if index == nodes.len() - 1 && !tty {
                 "-T"
             } else {
@@ -82,6 +122,7 @@ pub(crate) fn chain_command(
             "none".into(),
         ];
         args.extend(OPTIONS.iter().map(|v| v.to_string()));
+        args.extend(identity_args(node));
         args.extend([
             "-p".into(),
             node.port.clone(),
@@ -91,11 +132,7 @@ pub(crate) fn chain_command(
             node.host.clone(),
             script,
         ]);
-        script = format!(
-            "stty -echo; printf '%s\\n' {}; exec env LC_ALL=C SSH_ASKPASS_REQUIRE=never {}",
-            quote(&marker(node, token)),
-            args.iter().map(|v| quote(v)).collect::<Vec<_>>().join(" ")
-        );
+        script = invoke(nodes[index - 1].options.os, &args, &marker(node, token));
     }
     let first = &nodes[0];
     let mut cmd = CommandBuilder::new("ssh");
@@ -109,6 +146,7 @@ pub(crate) fn chain_command(
         "none",
     ]);
     cmd.args(OPTIONS);
+    cmd.args(identity_args(first));
     cmd.args([
         "-p",
         &first.port,
@@ -119,15 +157,20 @@ pub(crate) fn chain_command(
         &script,
     ]);
     cmd.env("TF_NODE_LABEL", first.label());
+    cmd.env(
+        "TF_AUTH_SEQUENCE",
+        serde_json::to_string(&nodes[1..].iter().map(SshNode::label).collect::<Vec<_>>()).unwrap(),
+    );
     cmd.env("LC_ALL", "C");
     cmd.env("SSH_ASKPASS_REQUIRE", "never");
     cmd.env_remove("SSH_ASKPASS");
     cmd
 }
 fn command(config: &RemoteConfig, path: &str, token: &str) -> CommandBuilder {
-    let script = format!(
-        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
-        protocol::encode_utf16le(&protocol::script(path, token))
+    let script = super::operations::command(
+        config.target_options.os,
+        &serde_json::json!({"op":"list", "path":path}),
+        token,
     );
     chain_command(
         &config.nodes().expect("validated configuration"),
@@ -157,7 +200,7 @@ pub fn read_directory(
         ask,
         Duration::from_secs(60),
     )?;
-    protocol::parse(&output, &token)
+    super::operations::listing(&output, &token)
 }
 
 struct ChildGuard(Box<dyn portable_pty::Child + Send + Sync>);
@@ -180,6 +223,12 @@ pub fn run_command(
         .and_then(|s| s.to_str())
         .unwrap_or("SSH")
         .to_string();
+    let mut expected: std::collections::VecDeque<String> = cmd
+        .get_env("TF_AUTH_SEQUENCE")
+        .and_then(|s| s.to_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let enforce_sequence = cmd.get_env("TF_AUTH_SEQUENCE").is_some();
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 40,
@@ -191,7 +240,9 @@ pub fn run_command(
     let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let mut writer = pair.master.take_writer().map_err(io::Error::other)?;
     let mut child = ChildGuard(pair.slave.spawn_command(cmd).map_err(|e| {
-        io::Error::other(format!("无法启动 ssh，请确认已安装 openssh-client：{e}"))
+        io::Error::other(format!(
+            "无法启动命令，请确认已安装 OpenSSH 客户端和 Python 3：{e}"
+        ))
     })?);
     drop(pair.slave);
     let (tx, rx) = mpsc::sync_channel(16);
@@ -215,10 +266,11 @@ pub fn run_command(
         let mut output = Zeroizing::new(String::new());
         let mut prompt_buffer = String::new();
         let mut hop = initial_hop;
-        let data_marker = format!("TF_LIST_V1_BEGIN_{token}");
         let mut data_started = false;
         let mut idle = Instant::now();
         let mut attempts = 0;
+        let mut terminal_text = TerminalText::default();
+        let mut received = 0usize;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(
@@ -229,19 +281,24 @@ pub fn run_command(
             if idle.elapsed() >= timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "远程读取超时；检查网络、SSH 和 Windows PowerShell",
+                    "远程操作超时；检查网络、SSH 和远端运行环境",
                 ));
             }
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(bytes) => {
                     idle = Instant::now();
+                    received += bytes.len();
+                    if received > LIMIT {
+                        return Err(io::Error::other("终端响应超过 16 MiB，请分批操作"));
+                    }
+                    let text = terminal_text.push(&bytes);
                     // Protocol and OpenSSH LC_ALL=C prompts are ASCII. File names
                     // and server-side errors are carried as base64 UTF-8.
-                    output.push_str(&String::from_utf8_lossy(&bytes));
+                    output.push_str(&text);
                     if output.len() > LIMIT {
                         return Err(io::Error::other("目录响应超过 16 MiB，请选择更小的目录"));
                     }
-                    prompt_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    prompt_buffer.push_str(&text);
                     let prefix = format!("TF_NODE_{token}:");
                     while let Some(start) = prompt_buffer.find(&prefix) {
                         let rest = &prompt_buffer[start + prefix.len()..];
@@ -253,11 +310,19 @@ pub fn run_command(
                             base64::engine::general_purpose::STANDARD.decode(&rest[..end])
                             && let Ok(label) = String::from_utf8(bytes)
                         {
+                            if enforce_sequence && expected.pop_front().as_ref() != Some(&label) {
+                                return Err(io::Error::other(
+                                    "远端返回非预期认证节点，已拒绝发送凭据",
+                                ));
+                            }
                             hop = label;
+                            data_started = false;
                         }
                         prompt_buffer = rest[end + 1..].to_string();
                     }
-                    if prompt_buffer.contains(&data_marker) {
+                    if prompt_buffer.contains(&format!("TF_READY_{token}"))
+                        || prompt_buffer.contains(&format!("TF_RPC_{token}_BEGIN"))
+                    {
                         data_started = true;
                     }
                     if !data_started && let Some(host_key) = prompt_kind(&prompt_buffer) {
@@ -271,7 +336,26 @@ pub fn run_command(
                                 details: fingerprint_details(&prompt_buffer),
                             }
                         } else {
-                            Prompt::Secret { hop: hop.clone() }
+                            if prompt_buffer
+                                .trim_end()
+                                .rsplit(['\r', '\n'])
+                                .next()
+                                .unwrap_or_default()
+                                .to_ascii_lowercase()
+                                .starts_with("enter passphrase for key ")
+                            {
+                                Prompt::KeyPassphrase {
+                                    hop: hop.clone(),
+                                    key: prompt_buffer
+                                        .trim()
+                                        .rsplit(['\r', '\n'])
+                                        .next()
+                                        .unwrap_or_default()
+                                        .into(),
+                                }
+                            } else {
+                                Prompt::Secret { hop: hop.clone() }
+                            }
                         };
                         let answer = ask(prompt)?.ok_or_else(|| {
                             io::Error::new(io::ErrorKind::Interrupted, "已取消认证，SSH 已断开")
@@ -302,8 +386,9 @@ pub fn run_command(
                         if !status.success() {
                             // Decode a framed PowerShell error, otherwise offer
                             // useful OpenSSH diagnostics without a raw transcript.
-                            if output.contains(&format!("TF_ERROR_{token}\t")) {
-                                return protocol::parse(&output, token).map(|_| String::new());
+                            if output.contains(&format!("TF_RPC_{token}_BEGIN")) {
+                                return super::operations::parse(&output, token)
+                                    .map(|_| String::new());
                             }
                             return Err(io::Error::other(ssh_error(&output, &hop)));
                         }
@@ -377,9 +462,9 @@ fn ssh_error(output: &str, hop: &str) -> String {
     } else if lower.contains("timed out") || lower.contains("no route to host") {
         "网络不可达或连接超时"
     } else if lower.contains("not found") || lower.contains("not recognized") {
-        "找不到 ssh、scp 或 powershell.exe；检查跳板机 OpenSSH 和 Windows PowerShell"
+        "找不到 ssh、sftp、python3 或 powershell.exe；检查节点运行环境"
     } else {
-        "SSH/SCP 命令失败；检查网络、认证、SFTP 服务与文件路径"
+        "SSH/SFTP 命令失败；检查网络、认证、SFTP 服务与文件路径"
     };
     format!("{hop}：{reason}；连接已关闭")
 }
@@ -387,6 +472,68 @@ fn ssh_error(output: &str, hop: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_console_sequences_can_split_across_reads() {
+        let mut parser = TerminalText::default();
+        assert_eq!(parser.push(b"\x1b[?25"), "");
+        assert_eq!(parser.push(b"huser password: \x1b[0m"), "user password: ");
+        assert_eq!(parser.push(b"\x1b]0;window"), "");
+        assert_eq!(
+            parser.push(b" title\x1b\\TF_READY_test\r\n"),
+            "TF_READY_test\r\n"
+        );
+    }
+    #[test]
+    fn rejects_out_of_order_credentials_and_ignores_prompts_after_ready() {
+        let mut cmd = CommandBuilder::new("python3");
+        cmd.args([
+            "-c",
+            "print('TF_NODE_test:dmljdGltQGhvc3Q6MjI=\\npassword: ', end='', flush=True)",
+        ]);
+        cmd.env("TF_AUTH_SEQUENCE", "[]");
+        let result = run_command(
+            cmd,
+            "test",
+            &AtomicBool::new(false),
+            |_| panic!("must not disclose a secret"),
+            Duration::from_secs(3),
+        );
+        assert!(result.unwrap_err().to_string().contains("非预期认证节点"));
+        let mut cmd = CommandBuilder::new("python3");
+        cmd.args([
+            "-c",
+            "print('TF_READY_test\\npassword: ', end='', flush=True)",
+        ]);
+        cmd.env("TF_AUTH_SEQUENCE", "[]");
+        assert!(
+            run_command(
+                cmd,
+                "test",
+                &AtomicBool::new(false),
+                |_| panic!("remote output is not an authentication prompt"),
+                Duration::from_secs(3)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cancelling_helper_with_child_process_releases_terminal() {
+        let mut cmd = CommandBuilder::new("python3");
+        cmd.args(["-c", "import subprocess,time; subprocess.Popen(['sleep','30']); print('user password: ',end='',flush=True); time.sleep(30)"]);
+        let started = Instant::now();
+        assert!(
+            run_command(
+                cmd,
+                "test",
+                &AtomicBool::new(false),
+                |_| Ok(None),
+                Duration::from_secs(3)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
     #[test]
     fn recursive_chain_authentication_identifies_each_node() {
         use crate::config::SshNode;
@@ -413,6 +560,7 @@ os.execv('/bin/sh',['sh','-c',args[-1]])
                     host: format!("node{i}.test"),
                     port: format!("{}", 2200 + i),
                     user: "user".into(),
+                    options: crate::config::NodeOptions::linux(),
                 })
                 .collect();
             let mut cmd = chain_command(&nodes, "printf 'finished\\n'", "test", false);
@@ -454,6 +602,7 @@ os.execv('/bin/sh',['sh','-c',args[-1]])
             windows_port: "2222".into(),
             windows_user: "a'b $(exit 81); & user".into(),
             windows_root: "C:/".into(),
+            ..Default::default()
         };
         let path = "C:/资料 ' $(exit 82); & 文件";
         let cmd = command(&config, path, "test");
@@ -479,7 +628,11 @@ os.execv('/bin/sh',['sh','-c',args[-1]])
         let args = result.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
         assert!(args.contains(&config.windows_user.as_bytes()));
         assert_eq!(args[args.len() - 3], config.windows_host.as_bytes());
-        let encoded = protocol::encode_utf16le(&protocol::script(path, "test"));
+        let encoded = crate::remote::operations::command(
+            crate::config::RemoteOs::Windows,
+            &serde_json::json!({"op":"list", "path":path}),
+            "test",
+        );
         assert!(
             std::str::from_utf8(args[args.len() - 2])
                 .unwrap()
@@ -513,7 +666,8 @@ assert input() == "test-secret"
 print("\nTF_NODE_test:Ym9iQHdpbmRvd3M6MjI=", flush=True)
 sys.stdout.write("bob@windows's password: "); sys.stdout.flush()
 assert input() == "test-secret"
-print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
+import base64,json
+print("\nTF_RPC_test_BEGIN\n"+base64.b64encode(json.dumps({"ok":True,"value":{"path":"C:/","entries":[]}}).encode()).decode()+"\nTF_RPC_test_END",flush=True)
 "#;
         let mut cmd = CommandBuilder::new("python3");
         cmd.args(["-c", program]);
@@ -529,7 +683,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
                         hops.push(hop);
                         "yes"
                     }
-                    Prompt::Secret { hop } => {
+                    Prompt::Secret { hop } | Prompt::KeyPassphrase { hop, .. } => {
                         hops.push(hop);
                         "test-secret"
                     }
@@ -541,7 +695,7 @@ print("\nTF_LIST_V1_BEGIN_test\nP\tQzov\nTF_LIST_V1_END_test", flush=True)
         .unwrap();
         assert_eq!(hops, ["SSH", "SSH", "bob@windows:22"]);
         assert!(!output.contains("test-secret"));
-        assert!(protocol::parse(&output, "test").is_ok());
+        assert!(super::super::operations::listing(&output, "test").is_ok());
     }
 
     #[test]

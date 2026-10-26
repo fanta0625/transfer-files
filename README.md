@@ -1,25 +1,17 @@
 # Transfer Files
 
-Rust + Slint 双栏文件管理原型，为后续“公司 Linux → 公网 SSH 跳板机 → 家里 Windows”的两段传输客户端验证交互。
+Rust + Slint 双栏文件传输客户端。Linux 客户端可以直连或逐级连接 Windows / Linux 中转节点，最终目标也支持 Windows / Linux。
 
-**已接入 Linux 客户端的两段 SSH 认证和 Windows 目录浏览。保存远程配置后，左栏为本地、右栏为远程；点击读取时连接，完成后断开并保留目录快照。远程文件和目录上传下载已实现，向 Dolphin 拖出尚未实现。**
+- 每个中转节点和目标分别设置系统类型、用户名、端口、私钥路径。
+- 密码和私钥口令支持 **5 分钟过期 / 永不过期（本次程序运行期间）/ 一次性（不缓存）**，均不写入磁盘。
+- 目录浏览按次连接，结束后断开并保留内存快照。
+- 文件和目录通过逐段 SFTP 传输，支持校验后的断点续传、空目录、零字节文件。
+- 中断后重新选择相同的源和目标，会发现已有暂存文件并续传；源内容改变时创建新任务。不会自动后台重连。
+- 续传前校验已有内容的 SHA-256，传输后校验完整清单。最终文件/目录先暂存，再禁止覆盖发布；同名且内容相同跳过，不同则报错。
+- 拒绝符号链接、Windows junction 和特殊文件。暂不支持控制字符文件名；跨系统文件名还受目标文件系统限制。
+- 客户端仍只支持 Linux 远程操作；Windows 构建用于本地交互和 PowerShell 适配验证。
 
-![远程浏览原型界面](docs/images/remote-browser.png)
-
-截图由无窗口软件渲染测试注入模拟远程结果生成，用于检查布局；不是真实 SSH 或龙芯实机截图。
-
-## 功能
-
-- 双栏目录浏览，路径输入、上级、刷新；目录优先、名称排序，显示大小与 UTC 修改时间。
-- 勾选多项、全选、清空选择；双击目录进入。
-- 本地验证模式：内部双向拖拽复制，也支持 Dolphin 拖入文件、多个文件、目录。
-- 后台扫描及复制、字节进度、错误日志、取消。
-- 同名目标跳过，源文件保留；目录同名整体跳过，不合并。
-- “远程设置”保存非敏感参数；连接时在 GUI 分别输入两端密码，首次连接显示主机指纹确认。
-- 远程模式：读取、双击目录、上级和刷新都会单独连接，完成后断开；当前目录快照保留在内存中，标注读取时间，失败时保留旧快照。
-- 远程面板支持从左侧上传、从右侧下载；文件夹使用 scp -r 递归传输，Dolphin 拖入右栏也会上传。
-
-远程传输通过两段 SCP 完成，分别使用设置中的跳板机端口和 Windows 端口。下载顺序为 Windows → 跳板机 → 本地；成功后删除本任务的跳板机暂存目录并刷新左栏。失败或取消时，日志显示失败阶段及可能保留的暂存位置，不自动删除未完成任务的数据。本地已有同名项目时下载会拒绝；上传目前沿用 SCP 的覆盖/目录合并行为。远程进度按选中项目计数，并非逐字节进度。
+详细配置、密钥位置与续传边界见 [连接和断点续传](docs/connection-and-resume.md)。实现已加入自动化测试，实际 Windows 中转 OpenSSH 链路仍须在目标环境验收。
 
 ## 在龙芯 Linux 上运行
 
@@ -64,51 +56,28 @@ sudo apt install ./target/debian/transfer-files_*.deb
 
 若已经编译好本机程序，可省略构建：`bash scripts/build-deb.sh --binary /绝对路径/transfer-files`。打包无需 sudo。使用软件渲染，桌面入口默认 X11，与现有启动脚本一致。
 
-## 读取家里 Windows 的目录
+## 配置远程连接
 
-### 通用连接设置（2026-10-23）
+1. 点击“远程设置”，按实际连接顺序添加中转节点；没有中转时直接连接目标。
+2. 每台电脑选择 **Linux / Windows**。旧配置自动沿用 Linux 中转、Windows 目标。
+3. 为目标填写默认目录：Linux 如 `/home/user`，Windows 如 `C:/Users/user`。
+4. 私钥路径可留空（使用 OpenSSH 默认密钥、agent 或密码）；指定时使用 `IdentitiesOnly=yes`。首个节点的私钥在本机，后续节点的私钥在其上一台电脑。程序不会复制私钥或转发 agent。
+5. 选择密码缓存时长后保存。保存和启动均不自动连接，点击“读取远程目录”才发起连接。
+6. 首次连接需要核对主机指纹，沿用发起连接端的 OpenSSH `known_hosts`。密码和私钥口令分别缓存，修改配置会清空缓存。
 
-目标主机填写 IP/域名、端口、用户名和默认目录，界面自动用目标地址命名；认证弹窗显示当前节点的 `用户名@地址:端口`。
+客户端需要 `python3`、OpenSSH `ssh`/`sftp`。Linux 节点需要 Python 3，Windows 节点需要 Windows PowerShell 5.1。中转节点还需要 `ssh`、`sftp` 客户端，并允许 SSH 分配终端；全部被连接节点需要 OpenSSH 服务端和可用 SFTP 子系统。不使用 ProxyJump、端口或 agent 转发，不安装远端常驻服务。
 
-- 直连：中转节点留空，或点击“清空中转（直连）”。
-- 逐级中转：点击“添加一级中转”，在表格中分别填写 **IP/域名、用户名、端口**（默认 22）。用 ↑ / ↓ 调整顺序，× 删除当前行。表格从上到下就是连接顺序。
-- 旧版命令行格式及更早的配置会自动读取并显示到表格，不需要重新填写。
+Linux 配置位于 `~/.config/transfer-files/config.conf`（支持 `XDG_CONFIG_HOME`）。密码不写入配置、命令参数或环境变量。认证弹窗最多等待两分钟；目录读取空闲超时 60 秒；传输和大文件哈希操作空闲超时 30 分钟，取消仍会主动终止本应用的本地 SSH 子进程。
 
-下方填写最终目标主机。编辑、删除整行或调整行顺序即可修改连接链；最多 7 级中转加 1 台目标。旧版配置自动迁移，修改配置会清空密码缓存。各节点密码按用户名、地址、端口独立缓存 5 分钟，不因其他节点输入密码延长。
+完整读取/哈希清单上限为 16 MiB，目录条目很多时请分批传输。远程进度目前按选中项目计数，不是字节进度。
 
-当前目标目录读取仍要求 Windows PowerShell；中转节点需要 POSIX shell、ssh/scp、stty、env、mkdir、rm 和暂存空间。通用化指连接拓扑和名称，尚未支持 Linux 目标目录浏览。逐层普通 SSH 不使用 ProxyJump 或端口转发。
-
-传输逐段暂存，全部成功后由后向前清理中转目录；直连不创建中转暂存。失败日志显示具体节点与可能残留的暂存位置。
-
-1. 点击右上角“远程设置”，填写可选中转节点，以及目标地址、端口、用户名和默认目录，例如 `C:/Users/你的用户名`。
-2. 保存后右栏切换为远程面板，点击“读取远程目录”。保存设置和启动程序都不会自动连接。
-3. 若遇到新主机，核对弹窗中的主机指纹后确认。每个节点的信任记录保存在连接它的上一台电脑，本地保存首个节点的记录，沿用各端 OpenSSH 的 `known_hosts`。
-4. 按提示依次输入连接链各节点的密码。密码只在内存中缓存 5 分钟，期间重复读取和传输会复用；过期后重新询问。若已有可用密钥，OpenSSH 可能直接认证成功。
-5. 读完显示“SSH 已断开”。双击目录、点击上级或刷新时，会重新连接认证；当前仅缓存最近一次成功读取的目录，不在磁盘保存目录快照。
-
-Linux 默认配置位置为 `~/.config/transfer-files/config.conf`，支持 `XDG_CONFIG_HOME`；密码不写入配置、命令参数、环境变量或日志。GUI 等待认证最多两分钟，网络读取空闲超时 60 秒，目录响应上限 16 MiB。取消或关闭窗口会请求终止本应用的 SSH 并等待清理。
-
-前提：公司电脑和 Linux 跳板机已有 `ssh`，跳板机允许分配 SSH 终端并能运行 POSIX shell、`stty`、`env`；Windows OpenSSH 可运行 `powershell.exe`（Windows PowerShell 5.1）。无需安装跳板机辅助服务，不使用 ProxyJump、端口转发或额外隧道。当前适配普通密码、公钥及私钥口令提示；自定义 MFA/OTP、keyboard-interactive 提示尚不支持。远程浏览仅支持 Linux 客户端，Windows 构建用于本地交互和 PowerShell 协议验证。
-
-更新源码后必须先执行 `cargo build --release --locked`，再启动程序；启动脚本不会自动重建已有程序。
-
-未配置远程时，两栏默认打开当前目录。传入两个目录参数可强制进入本地验证模式，路径含空格时加引号：
+未配置远程时，两栏默认打开当前目录。传入两个目录参数可强制进入本地验证模式：
 
 ```bash
 cargo run --locked -- "$HOME/Downloads" "$HOME/Documents"
 ```
 
-明确选择 X11（本应用的原生外部拖入适配针对 X11）：
-
-```bash
-WINIT_UNIX_BACKEND=x11 cargo run --locked
-```
-
-首次构建会下载 Rust 依赖。系统 C/C++ 编译工具已在用户电脑确认可用。若构建或启动提示缺少系统库，Loongnix 的 Debian 风格仓库可参考以下包名；以目标仓库实际可用包为准：
-
-```bash
-sudo apt install build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libx11-dev libxcb1-dev
-```
+源代码更新后执行 `cargo build --release --locked`，启动脚本不会自动重建已有程序。
 
 ## 本地验证模式操作方式
 
@@ -159,8 +128,10 @@ src/main.rs                     界面控制、目录工作线程、拖放适配
 src/config.rs                   远程连接参数的加载、校验和保存（不含密码）
 src/files.rs                    本地目录读取与可取消的复制引擎
 src/remote.rs                   Windows 路径处理与远程读取入口
-src/remote/terminal.rs          Linux PTY、两段 SSH、认证与进程清理
-src/remote/protocol.rs          PowerShell 脚本与带版本边界的目录协议
+src/remote/terminal.rs          Linux PTY、混合系统 SSH 链、认证与进程清理
+src/remote/transfer.rs          逐段 SFTP、哈希校验、断点续传与发布
+src/remote/operations.rs        临时文件系统操作适配（Python / PowerShell）
+src/remote/fs_helper.*          Linux / Windows 文件系统操作与分帧响应
 ui/app.slint                    双栏界面
 docs/development-requirements.md 完整需求与后续 SSH 方案
 docs/prototype-validation.md    目标机验收与当前验证记录
