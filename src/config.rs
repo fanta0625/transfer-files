@@ -27,7 +27,7 @@ impl NodeOptions {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CachePolicy {
     Once,
     #[default]
@@ -59,8 +59,10 @@ impl CachePolicy {
 }
 
 /// Persistent connection settings. Passwords and private key contents are intentionally absent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RemoteConfig {
+    pub name: String,
     pub hop_options: Vec<NodeOptions>,
     pub target_options: NodeOptions,
     pub cache_policy: CachePolicy,
@@ -143,14 +145,16 @@ impl RemoteConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.nodes()?;
+        if self.name.chars().any(char::is_control) {
+            return Err("标签名称不能包含控制字符".into());
+        }
         if self.windows_root.is_empty() || self.windows_root.contains(['\r', '\n', '\0']) {
             return Err("目标默认目录不能为空或包含换行、空字符".into());
         }
         Ok(())
     }
 
-    pub fn load() -> io::Result<Self> {
-        let path = config_path();
+    pub fn load_from(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
             Ok(contents) => Ok(Self::from_contents(&contents)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self {
@@ -188,6 +192,7 @@ impl RemoteConfig {
             };
             let value = value.trim().to_string();
             match key.trim() {
+                "name" => config.name = value,
                 "credential_ttl" => {
                     config.cache_policy = CachePolicy::from_index(value.parse().unwrap_or(0))
                 }
@@ -216,6 +221,7 @@ impl RemoteConfig {
 
     fn to_contents(&self) -> String {
         let mut contents: String = [
+            ("name", &self.name),
             ("jump_host", &self.jump_host),
             ("jump_port", &self.jump_port),
             ("jump_user", &self.jump_user),
@@ -326,7 +332,7 @@ impl SshNode {
     }
 }
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     if let Ok(app_data) = std::env::var("APPDATA") {
         return PathBuf::from(app_data)

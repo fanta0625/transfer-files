@@ -1,6 +1,7 @@
 mod config;
 mod files;
 mod remote;
+mod tabs;
 
 use slint::{
     ComponentHandle, DataTransfer, Model, ModelRc, Timer, TimerMode, VecModel, language::DragAction,
@@ -44,7 +45,10 @@ enum Event {
     RemoteTransferFinished(u64, Result<String, String>),
 }
 
+type ConfigWriter = Rc<dyn Fn(&RemoteConfig) -> std::io::Result<PathBuf>>;
+
 struct State {
+    config_writer: Option<ConfigWriter>,
     panes: [Pane; 2],
     remote_config: RemoteConfig,
     remote_cancel: Arc<AtomicBool>,
@@ -195,6 +199,7 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
 }
 
 fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
+    ui.set_setting_tab_name(config.name.clone().into());
     ui.set_setting_target_system(if config.target_options.os == RemoteOs::Windows {
         1
     } else {
@@ -514,6 +519,7 @@ fn set_remote_not_ready(ui: &AppWindow) {
 }
 
 fn wire(ui: &AppWindow, state: &Shared) {
+    let config_writer = state.borrow().config_writer.clone();
     state
         .borrow()
         .credentials
@@ -610,6 +616,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
                 route.push(format!("{} {} {}", node.host, node.port, node.user));
             }
             let config = RemoteConfig {
+                name: ui.get_setting_tab_name().trim().into(),
                 hop_options: ui
                     .get_setting_hops()
                     .iter()
@@ -647,7 +654,10 @@ fn wire(ui: &AppWindow, state: &Shared) {
                 ui.set_detail(error.into());
                 return;
             }
-            match config.save() {
+            match config_writer
+                .as_ref()
+                .map_or_else(|| config.save(), |save| save(&config))
+            {
                 Ok(path) => {
                     let remote_root = PathBuf::from(&config.windows_root);
                     {
@@ -1127,92 +1137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .backend_name("winit".into())
         .renderer_name("software".into())
         .select()?;
-    let ui = AppWindow::new()?;
-    let initial = std::env::current_dir()?;
-    let args = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let (remote_config, load_error) = match RemoteConfig::load() {
-        Ok(config) => (config, None),
-        Err(error) => (RemoteConfig::default(), Some(error.to_string())),
-    };
-    let remote_enabled = remote_config.is_configured() && args.len() < 2;
-    let paths = [
-        args.first().cloned().unwrap_or_else(|| initial.clone()),
-        if remote_enabled {
-            PathBuf::from(&remote_config.windows_root)
-        } else {
-            args.get(1).cloned().unwrap_or_else(|| initial.clone())
-        },
-    ];
-    let (tx, rx) = mpsc::channel();
-    let state = Rc::new(RefCell::new(State {
-        panes: [
-            Pane {
-                path: initial.clone(),
-                remote: false,
-                ..Pane::default()
-            },
-            Pane {
-                path: if remote_enabled {
-                    PathBuf::from(&remote_config.windows_root)
-                } else {
-                    initial
-                },
-                remote: remote_enabled,
-                ..Pane::default()
-            },
-        ],
-        remote_config,
-        remote_cancel: Arc::new(AtomicBool::new(false)),
-        remote_worker: None,
-        auth_reply: None,
-        credentials: Arc::new(Mutex::new(remote::CredentialCache::default())),
-        tx,
-        cancel: Arc::new(AtomicBool::new(false)),
-        busy: false,
-        worker: None,
-        external: None,
-    }));
-    ui.set_active_pane(1);
-    paint_remote_config(&ui, &state.borrow().remote_config);
-    if let Some(error) = load_error {
-        ui.set_history(format!("读取配置失败，请检查「远程设置」：{error}").into());
-    }
-    wire(&ui, &state);
-    for (side, path) in paths.into_iter().enumerate() {
-        if state.borrow().panes[side].remote {
-            paint_pane(&ui, &state, side);
-        } else {
-            navigate(&ui, &state, side, path);
-        }
-    }
-    let timer = Timer::default();
-    let weak = ui.as_weak();
-    let shared = state.clone();
-    timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
-        if let Some(ui) = weak.upgrade() {
-            poll(&ui, &shared, &rx);
-        }
-    });
-    let shared = state.clone();
-    ui.window().on_close_requested(move || {
-        shared.borrow().cancel.store(true, Ordering::Relaxed);
-        shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
-        shared.borrow_mut().auth_reply.take();
-        slint::CloseRequestResponse::HideWindow
-    });
-    ui.run()?;
-    state.borrow().cancel.store(true, Ordering::Relaxed);
-    state.borrow().remote_cancel.store(true, Ordering::Relaxed);
-    state.borrow_mut().auth_reply.take();
-    if let Some(worker) = state.borrow_mut().worker.take() {
-        let _ = worker.join();
-    }
-    if let Some(worker) = state.borrow_mut().remote_worker.take() {
-        let _ = worker.join();
-    }
+    tabs::run()?;
     Ok(())
 }
 
@@ -1298,6 +1223,7 @@ mod ui_tests {
         ui.window().set_size(LogicalSize::new(1180.0, 800.0));
         let (tx, rx) = mpsc::channel();
         let state = Rc::new(RefCell::new(State {
+            config_writer: None,
             panes: [
                 Pane {
                     path: left.clone(),

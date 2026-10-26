@@ -1,5 +1,7 @@
 import { Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, ListView, ScrollView, TextEdit } from "std-widgets.slint";
 
+export struct RemoteTabRow { title: string, busy: bool, attention: bool }
+
 export struct HopRow { host: string, user: string, port: string, system: int, identity: string }
 
 export struct FileRow {
@@ -125,6 +127,12 @@ export component AppWindow inherits Window {
     min-width: 920px;
     min-height: 620px;
     background: #edf1f3;
+    in property <[RemoteTabRow]> tabs;
+    in property <int> selected-tab;
+    callback select-tab(int);
+    callback add-tab();
+    callback close-tab(int);
+    in-out property <string> setting-tab-name;
     in property <[FileRow]> left-rows;
     in property <[FileRow]> right-rows;
     in property <string> left-path;
@@ -200,6 +208,26 @@ export component AppWindow inherits Window {
             Rectangle { horizontal-stretch: 1; }
             Button { text: root.remote-reading ? "读取中…" : "读取远程目录"; enabled: root.right-remote && !root.remote-reading && !root.busy; clicked => { root.refresh(1); } }
             Button { text: "远程设置"; enabled: !root.busy && !root.remote-reading; clicked => { root.show-settings(); } }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            ScrollView {
+                height: 42px; content-height: self.visible-height;
+                HorizontalLayout {
+                    spacing: 6px;
+                    for tab[index] in root.tabs : HorizontalLayout {
+                        spacing: 0px; horizontal-stretch: 0;
+                        Button {
+                            width: 220px;
+                            text: (index == root.selected-tab ? "● " : "") + tab.title + (tab.attention ? " · 待认证" : (tab.busy ? " · 进行中" : ""));
+                            clicked => { root.select-tab(index); }
+                        }
+                        Button { text: "×"; width: 32px; clicked => { root.close-tab(index); } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+            Button { text: "+ 新连接"; clicked => { root.add-tab(); } }
         }
         Text { text: root.right-remote ? "远程模式 · 按配置链连接，完成后断开；支持文件和目录上传下载。" : "本地验证模式 · 两栏均为当前电脑目录。配置远程后可读取 Windows / Linux 目录。"; color: #526570; font-size: 13px; }
         HorizontalLayout {
@@ -280,6 +308,10 @@ export component AppWindow inherits Window {
                 padding: 22px;
                 spacing: 10px;
                 Text { text: "远程连接设置"; color: #173b3d; font-size: 21px; font-weight: 700; }
+                HorizontalLayout {
+                    Text { text: "标签名称"; width: 76px; vertical-alignment: center; }
+                    LineEdit { text <=> root.setting-tab-name; placeholder-text: "例如家里电脑、测试服务器；留空使用目标地址"; }
+                }
                 ScrollView {
                   content-width: self.visible-width;
                   VerticalLayout {

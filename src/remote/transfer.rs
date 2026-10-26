@@ -24,6 +24,28 @@ struct Item {
     size: u64,
     hash: String,
 }
+
+// Identical tabs must not write the same resumable staging files concurrently.
+static ACTIVE_TASKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+struct TaskClaim(String);
+impl TaskClaim {
+    fn acquire(id: &str) -> io::Result<Self> {
+        let mut active = ACTIVE_TASKS.get_or_init(Default::default).lock().unwrap();
+        if !active.insert(id.into()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "另一个标签正在传输相同的源和目标，请等待其完成",
+            ));
+        }
+        Ok(Self(id.into()))
+    }
+}
+impl Drop for TaskClaim {
+    fn drop(&mut self) {
+        ACTIVE_TASKS.get().unwrap().lock().unwrap().remove(&self.0);
+    }
+}
 struct Session<'a, F> {
     nodes: Vec<SshNode>,
     cancel: &'a AtomicBool,
@@ -300,6 +322,7 @@ fn transfer(
         "version":1, "source":source.path, "destination":destination.path, "download":download,
         "nodes":session.nodes.iter().map(|n| (n.label(), n.options.os)).collect::<Vec<_>>(), "items":items
     })).unwrap()));
+    let _claim = TaskClaim::acquire(&id)?;
     let order: Vec<Option<usize>> = if download {
         (0..last).rev().map(Some).chain([None]).collect()
     } else {
@@ -415,6 +438,15 @@ pub fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identical_tasks_are_excluded_until_the_first_exits() {
+        let first = TaskClaim::acquire("test-concurrent-transfer").unwrap();
+        assert!(TaskClaim::acquire("test-concurrent-transfer").is_err());
+        let other = TaskClaim::acquire("test-other-transfer").unwrap();
+        drop(first);
+        assert!(TaskClaim::acquire("test-concurrent-transfer").is_ok());
+        drop(other);
+    }
     #[test]
     fn rejects_traversal_and_batch_injection() {
         for name in ["", ".", "..", "../x", "x\\y", "x\nput secret"] {
@@ -548,6 +580,44 @@ mod tests {
                     })
                     .is_err()
             );
+        }
+        // Two independent tab workers can run the real SFTP engine concurrently.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let source = temp.path().join(format!("parallel-source-{index}"));
+            let target = temp.path().join(format!("parallel-target-{index}"));
+            std::fs::write(&source, vec![index as u8; 128 * 1024]).unwrap();
+            let config = RemoteConfig {
+                route: Some("parallel-hop.test 22 user".into()),
+                windows_host: format!("parallel-target-{index}.test"),
+                windows_port: "22".into(),
+                windows_user: "user".into(),
+                windows_root: temp.path().display().to_string(),
+                target_options: crate::config::NodeOptions::linux(),
+                ..Default::default()
+            };
+            let gate = gate.clone();
+            workers.push(std::thread::spawn(move || {
+                gate.wait();
+                transfer(
+                    &config,
+                    &source,
+                    target.to_str().unwrap(),
+                    false,
+                    &AtomicBool::new(false),
+                    |_| panic!("unexpected authentication in fixture"),
+                )
+                .unwrap();
+                assert_eq!(
+                    std::fs::read(source).unwrap(),
+                    std::fs::read(target).unwrap()
+                );
+            }));
+        }
+        gate.wait();
+        for worker in workers {
+            worker.join().unwrap();
         }
     }
 }
