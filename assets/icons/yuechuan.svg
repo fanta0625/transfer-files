@@ -1,37 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="跃传">
-  <defs>
-    <linearGradient id="tile" x1="80" y1="40" x2="440" y2="480" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#0b5c57"/>
-      <stop offset="0.55" stop-color="#137a70"/>
-      <stop offset="1" stop-color="#1a9283"/>
-    </linearGradient>
-    <linearGradient id="route" x1="260" y1="300" x2="402" y2="140" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffd166"/>
-      <stop offset="1" stop-color="#f7b733"/>
-    </linearGradient>
-    <linearGradient id="sheet" x1="104" y1="182" x2="254" y2="364" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#e9f7f4"/>
-    </linearGradient>
-  </defs>
-
-  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#tile)"/>
-  <circle cx="410" cy="102" r="104" fill="#ffffff" opacity="0.045"/>
-
-  <!-- File being transferred -->
-  <path d="M104 200a18 18 0 0 1 18-18h92l40 40v124a18 18 0 0 1-18 18h-114a18 18 0 0 1-18-18V200Z" fill="url(#sheet)"/>
-  <path d="M214 182v28a12 12 0 0 0 12 12h28l-40-40Z" fill="#bfe5de"/>
-  <rect x="132" y="244" width="96" height="13" rx="6.5" fill="#178477"/>
-  <rect x="132" y="276" width="96" height="13" rx="6.5" fill="#178477" opacity="0.72"/>
-  <rect x="132" y="308" width="62" height="13" rx="6.5" fill="#178477" opacity="0.46"/>
-
-  <!-- Multi-hop route -->
-  <path d="M254 286c58 2 54-132 138-138" fill="none" stroke="#0b5c57" stroke-width="44" stroke-linecap="round" opacity="0.35"/>
-  <path d="M254 286c58 2 54-132 138-138" fill="none" stroke="url(#route)" stroke-width="32" stroke-linecap="round"/>
-  <circle cx="304" cy="244" r="15" fill="#ffffff" stroke="#0b5c57" stroke-width="5"/>
-  <circle cx="338" cy="192" r="15" fill="#ffffff" stroke="#0b5c57" stroke-width="5"/>
-
-  <!-- Destination node -->
-  <circle cx="402" cy="148" r="50" fill="#ffffff"/>
-  <circle cx="402" cy="148" r="23" fill="#f7b733"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="#0b5f58"/>
+  <g transform="rotate(90 256 256)">
+    <path d="M116 336 L236 216 L356 336" fill="none" stroke="#ffc857" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M196 256 L316 136 L436 256" fill="none" stroke="#ffffff" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
 </svg>
