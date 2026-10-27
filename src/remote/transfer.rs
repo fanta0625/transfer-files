@@ -326,13 +326,46 @@ fn parse_meter(line: &str) -> Option<(String, u32, u64, f64)> {
     None
 }
 
-struct Session<'a, F> {
+/// Preserve ordinary stdout/stderr verbatim, excluding authentication lines and
+/// the application's encoded filesystem protocol (not SFTP diagnostics).
+fn diagnostic_text(text: &str, token: &str) -> String {
+    let mut framed = false;
+    text.split(['\r', '\n'])
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.trim() == format!("TF_RPC_{token}_BEGIN") {
+                framed = true;
+                return None;
+            }
+            if line.trim() == format!("TF_RPC_{token}_END") {
+                framed = false;
+                return None;
+            }
+            let lower = line.to_lowercase();
+            if framed
+                || line.is_empty()
+                || line.contains(&format!("TF_READY_{token}"))
+                || line.contains(&format!("TF_NODE_{token}:"))
+                || lower.contains("password:")
+                || lower.contains("enter passphrase for key")
+            {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct Session<'a, 'd, F> {
     nodes: Vec<SshNode>,
     cancel: &'a AtomicBool,
     ask: F,
     token: String,
+    diagnostic: Option<&'d mut dyn FnMut(&str)>,
 }
-impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, F> {
+impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, '_, F> {
     fn rpc(&mut self, node: Option<usize>, request: Value) -> io::Result<Value> {
         self.rpc_inner(node, request, None)
     }
@@ -378,6 +411,7 @@ impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, F> {
             ask,
             token,
             nodes: _,
+            diagnostic,
         } = self;
         let mut ignored = |_: &str| {};
         let sink: &mut dyn FnMut(&str) = match on_text {
@@ -385,13 +419,29 @@ impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, F> {
             None => &mut ignored,
         };
         // Large-file hashing may be silent; cancellation is still polled every 50ms.
-        let output = terminal::run_command_with_progress(
+        if let Some(sink) = diagnostic.as_deref_mut() {
+            let runner = node.map_or_else(|| "本机".to_string(), |i| self.nodes[i].label());
+            sink(&format!(
+                "操作 {} · 执行节点 {runner}",
+                request["op"].as_str().unwrap_or("unknown")
+            ));
+        }
+        let mut log = |text: &str| {
+            if let Some(sink) = diagnostic.as_deref_mut() {
+                let text = diagnostic_text(text, token);
+                if !text.is_empty() {
+                    sink(&text);
+                }
+            }
+        };
+        let output = terminal::run_command_with_diagnostics(
             cmd,
             token,
             cancel,
             ask,
             Duration::from_secs(1800),
             sink,
+            &mut log,
         )?;
         operations::parse(&output, token)
     }
@@ -644,6 +694,7 @@ fn sftp_quote(path: &str) -> io::Result<String> {
     escaped.push('"');
     Ok(escaped)
 }
+#[allow(clippy::too_many_arguments)]
 fn transfer(
     config: &RemoteConfig,
     local: &Path,
@@ -651,6 +702,7 @@ fn transfer(
     download: bool,
     cancel: &AtomicBool,
     mut progress: impl FnMut(TransferUpdate),
+    diagnostic: Option<&mut dyn FnMut(&str)>,
     ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
     config.validate().map_err(io::Error::other)?;
@@ -690,6 +742,7 @@ fn transfer(
         cancel,
         ask,
         token,
+        diagnostic,
     };
     let items = session.manifest(&source)?;
     if session.rpc(
@@ -805,6 +858,7 @@ pub fn upload(
     target_dir: &str,
     cancel: &AtomicBool,
     progress: impl FnMut(TransferUpdate),
+    diagnostic: Option<&mut dyn FnMut(&str)>,
     ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
     let source = std::path::absolute(source)?;
@@ -825,9 +879,11 @@ pub fn upload(
         false,
         cancel,
         progress,
+        diagnostic,
         ask,
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub fn download(
     config: &RemoteConfig,
     source: &str,
@@ -835,6 +891,7 @@ pub fn download(
     target_dir: &Path,
     cancel: &AtomicBool,
     progress: impl FnMut(TransferUpdate),
+    diagnostic: Option<&mut dyn FnMut(&str)>,
     ask: impl FnMut(Prompt) -> io::Result<Answer>,
 ) -> io::Result<()> {
     valid_name(name)?;
@@ -845,12 +902,21 @@ pub fn download(
         true,
         cancel,
         progress,
+        diagnostic,
         ask,
     )
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_keep_unrecognized_output_and_hide_internal_frames_and_authentication() {
+        let text = "TF_READY_test\r\nordinary stdout\r\nunrecognized failure\r\nPermission denied (publickey,password).\r\npassword: hidden\r\nTF_RPC_test_BEGIN\r\ncHJpdmF0ZQ==\r\nTF_RPC_test_END\r\nafter frame\r\n";
+        assert_eq!(
+            diagnostic_text(text, "test"),
+            "ordinary stdout\nunrecognized failure\nPermission denied (publickey,password).\nafter frame"
+        );
+    }
     #[test]
     fn identical_tasks_are_excluded_until_the_first_exits() {
         let first = TaskClaim::acquire("test-concurrent-transfer").unwrap();
@@ -981,6 +1047,7 @@ mod tests {
                 false,
                 &cancel,
                 |update| updates.push(update),
+                None,
                 ask,
             )
             .unwrap();
@@ -1000,6 +1067,7 @@ mod tests {
                 true,
                 &cancel,
                 |_| {},
+                None,
                 ask,
             )
             .unwrap();
@@ -1017,6 +1085,7 @@ mod tests {
                     true,
                     &cancel,
                     |_| {},
+                    None,
                     ask
                 )
                 .is_err()
@@ -1027,11 +1096,14 @@ mod tests {
             );
 
             let nodes = config.nodes().unwrap();
+            let diagnostic = std::cell::RefCell::new(Vec::new());
+            let mut capture = |text: &str| diagnostic.borrow_mut().push(text.to_string());
             let mut session = Session {
                 nodes,
                 cancel: &cancel,
                 ask,
                 token: "resume-test".into(),
+                diagnostic: Some(&mut capture),
             };
             // Exercise the entire PTY/helper/framed-error path with a real SFTP
             // failure, rather than only testing fabricated terminal messages.
@@ -1053,6 +1125,9 @@ mod tests {
                 .to_string();
             assert!(error.contains("SFTP 原因："), "{error}");
             assert!(error.contains("not found"), "{error}");
+            let diagnostic = diagnostic.borrow().join("\n");
+            assert!(diagnostic.contains("not found"), "{diagnostic}");
+            assert!(!diagnostic.contains("TF_RPC_"), "{diagnostic}");
             let src = Location {
                 node: None,
                 path: source.join("a [b]*? ' \"文件.txt").display().to_string(),
@@ -1142,6 +1217,7 @@ mod tests {
                     false,
                     &AtomicBool::new(false),
                     |_| {},
+                    None,
                     |_| panic!("unexpected authentication in fixture"),
                 )
                 .unwrap();

@@ -161,6 +161,7 @@ export component AppWindow inherits Window {
     in property <string> history;
     in-out property <string> transfer-log;
     in-out property <bool> transfer-log-auto-scroll: true;
+    in-out property <bool> diagnostic-mode: false;
     callback clear-transfer-log();
     in-out property <int> setting-target-system: 1;
     in-out property <string> setting-target-identity;
@@ -310,6 +311,11 @@ export component AppWindow inherits Window {
                     Text { text: "实时来自实际传输；多个标签各自保留输出"; color: #667782; font-size: 11px; vertical-alignment: center; }
                     Text { text: root.history; visible: root.history != ""; color: #8a5a20; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
+                    CheckBox {
+                        text: "诊断模式";
+                        checked <=> root.diagnostic-mode;
+                        enabled: !root.busy && !root.remote-reading;
+                    }
                     CheckBox {
                         text: "自动滚动";
                         checked <=> root.transfer-log-auto-scroll;

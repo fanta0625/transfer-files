@@ -43,6 +43,8 @@ enum Event {
     Finished(files::Report),
     #[cfg(target_os = "linux")]
     RemoteProgress(u64, remote::transfer::TransferUpdate),
+    #[cfg(target_os = "linux")]
+    RemoteDiagnostic(u64, String),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RemoteTransferFinished(u64, Result<String, String>),
 }
@@ -330,7 +332,7 @@ fn push_transfer_log(ui: &AppWindow, state: &Shared, note: &str) {
         return;
     }
     let mut state = state.borrow_mut();
-    if state.transfer_last_note == note {
+    if state.transfer_last_note == note && !note.starts_with("[诊断]") {
         return;
     }
     state.transfer_last_note = note.into();
@@ -338,8 +340,14 @@ fn push_transfer_log(ui: &AppWindow, state: &Shared, note: &str) {
         "[{}] {note}",
         chrono::Utc::now().format("%H:%M:%S")
     ));
-    if state.transfer_log.len() > 600 {
-        state.transfer_log.drain(..100);
+    let limit = if ui.get_diagnostic_mode() {
+        10_000
+    } else {
+        600
+    };
+    if state.transfer_log.len() > limit {
+        let remove = (state.transfer_log.len() - limit).max(100);
+        state.transfer_log.drain(..remove);
     }
     ui.set_transfer_log(state.transfer_log.join("\n").into());
 }
@@ -606,7 +614,11 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
     ui.set_remote_reading(true);
     ui.set_progress(0.0);
     ui.set_status(format!("正在下载 {} 个项目…", sources.len()).into());
+    let diagnostic_enabled = ui.get_diagnostic_mode();
     let worker = thread::spawn(move || {
+        let mut diagnostic = |text: &str| {
+            let _ = tx.send(Event::RemoteDiagnostic(generation, text.to_string()));
+        };
         let result = (|| {
             for source in &sources {
                 let name =
@@ -620,6 +632,11 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
                     &cancel,
                     |update| {
                         let _ = tx.send(Event::RemoteProgress(generation, update));
+                    },
+                    if diagnostic_enabled {
+                        Some(&mut diagnostic)
+                    } else {
+                        None
                     },
                     |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
                 )
@@ -666,7 +683,11 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
         )
         .into(),
     );
+    let diagnostic_enabled = ui.get_diagnostic_mode();
     let worker = thread::spawn(move || {
+        let mut diagnostic = |text: &str| {
+            let _ = tx.send(Event::RemoteDiagnostic(generation, text.to_string()));
+        };
         let result = (|| {
             for source in &sources {
                 if cancel.load(Ordering::Relaxed) {
@@ -679,6 +700,11 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
                     &cancel,
                     |update| {
                         let _ = tx.send(Event::RemoteProgress(generation, update));
+                    },
+                    if diagnostic_enabled {
+                        Some(&mut diagnostic)
+                    } else {
+                        None
                     },
                     |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
                 )
@@ -1219,6 +1245,15 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                     .into(),
                 );
                 ui.set_detail(progress.current.into());
+            }
+            #[cfg(target_os = "linux")]
+            Event::RemoteDiagnostic(generation, text) => {
+                if generation != state.borrow().panes[1].generation {
+                    continue;
+                }
+                for line in text.lines() {
+                    push_transfer_log(ui, state, &format!("[诊断] {line}"));
+                }
             }
             #[cfg(target_os = "linux")]
             Event::RemoteProgress(generation, update) => {

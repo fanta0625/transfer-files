@@ -76,6 +76,7 @@ struct Presentation {
     auth_host_key: bool,
     transfer_log: slint::SharedString,
     transfer_log_auto_scroll: bool,
+    diagnostic_mode: bool,
 }
 impl Default for Presentation {
     fn default() -> Self {
@@ -93,6 +94,7 @@ impl Default for Presentation {
             auth_host_key: false,
             transfer_log: "".into(),
             transfer_log_auto_scroll: true,
+            diagnostic_mode: false,
         }
     }
 }
@@ -112,6 +114,7 @@ impl Presentation {
             auth_host_key: ui.get_auth_host_key(),
             transfer_log: ui.get_transfer_log(),
             transfer_log_auto_scroll: ui.get_transfer_log_auto_scroll(),
+            diagnostic_mode: ui.get_diagnostic_mode(),
         }
     }
     fn apply(&self, ui: &AppWindow) {
@@ -128,6 +131,7 @@ impl Presentation {
         ui.set_auth_host_key(self.auth_host_key);
         ui.set_transfer_log(self.transfer_log.clone());
         ui.set_transfer_log_auto_scroll(self.transfer_log_auto_scroll);
+        ui.set_diagnostic_mode(self.diagnostic_mode);
         // Never copy a typed password between views or tabs.
         ui.set_auth_secret("".into());
     }
@@ -690,7 +694,22 @@ mod tests {
                 .unwrap();
             workspace.borrow_mut().tick(&ui);
             assert!(ui.get_transfer_log().contains("beta.bin"));
+            ui.set_diagnostic_mode(true);
             workspace.borrow_mut().select(&ui, 0);
+            assert!(!ui.get_diagnostic_mode());
+            states[1]
+                .borrow()
+                .tx
+                .send(Event::RemoteDiagnostic(
+                    1,
+                    "beta stdout\nbeta stderr".into(),
+                ))
+                .unwrap();
+            states[0]
+                .borrow()
+                .tx
+                .send(Event::RemoteDiagnostic(0, "stale diagnostic".into()))
+                .unwrap();
             states[0]
                 .borrow()
                 .tx
@@ -699,10 +718,15 @@ mod tests {
             workspace.borrow_mut().tick(&ui);
             assert!(ui.get_transfer_log().contains("alpha.bin"));
             assert!(!ui.get_transfer_log().contains("beta.bin"));
+            assert!(!ui.get_transfer_log().contains("beta stdout"));
+            assert!(!ui.get_transfer_log().contains("stale diagnostic"));
             ui.invoke_clear_transfer_log();
             assert!(ui.get_transfer_log().is_empty());
             workspace.borrow_mut().select(&ui, 1);
             assert!(ui.get_transfer_log().contains("beta.bin"));
+            assert!(ui.get_diagnostic_mode());
+            assert!(ui.get_transfer_log().contains("beta stdout"));
+            assert!(ui.get_transfer_log().contains("beta stderr"));
             workspace.borrow_mut().select(&ui, 0);
             assert!(ui.get_transfer_log().is_empty());
             // Leave beta selected for the authentication checks below.

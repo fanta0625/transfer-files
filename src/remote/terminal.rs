@@ -228,9 +228,21 @@ pub fn run_command_with_progress(
     cmd: CommandBuilder,
     token: &str,
     cancel: &AtomicBool,
+    ask: impl FnMut(Prompt) -> io::Result<Answer>,
+    timeout: Duration,
+    on_text: &mut dyn FnMut(&str),
+) -> io::Result<String> {
+    run_command_with_diagnostics(cmd, token, cancel, ask, timeout, on_text, &mut |_| {})
+}
+
+pub fn run_command_with_diagnostics(
+    cmd: CommandBuilder,
+    token: &str,
+    cancel: &AtomicBool,
     mut ask: impl FnMut(Prompt) -> io::Result<Answer>,
     timeout: Duration,
     on_text: &mut dyn FnMut(&str),
+    on_diagnostic: &mut dyn FnMut(&str),
 ) -> io::Result<String> {
     let initial_hop = cmd
         .get_env("TF_NODE_LABEL")
@@ -278,8 +290,9 @@ pub fn run_command_with_progress(
             }
         }
     });
+    let mut output = Zeroizing::new(String::new());
+    let mut diagnostic_secrets: Vec<Zeroizing<String>> = Vec::new();
     let result = (|| {
-        let mut output = Zeroizing::new(String::new());
         let mut prompt_buffer = String::new();
         let mut hop = initial_hop;
         let mut data_started = false;
@@ -390,6 +403,10 @@ pub fn run_command_with_progress(
                         }
                         // OpenSSH disables terminal echo before asking. Do not
                         // keep or publish the terminal transcript of credentials.
+                        emit_diagnostic(&output, &diagnostic_secrets, on_diagnostic);
+                        if !host_key && !answer.is_empty() {
+                            diagnostic_secrets.push(Zeroizing::new(answer.to_string()));
+                        }
                         writer.write_all(answer.as_bytes())?;
                         writer.write_all(b"\n")?;
                         writer.flush()?;
@@ -418,6 +435,9 @@ pub fn run_command_with_progress(
             }
         }
     })();
+    // Include failure output too. Publish only outside authentication exchanges;
+    // the caller removes prompts and private protocol frames before display.
+    emit_diagnostic(&output, &diagnostic_secrets, on_diagnostic);
     // Kill/wait our own ssh before dropping the terminal and joining its reader.
     drop(child);
     drop(writer);
@@ -425,6 +445,14 @@ pub fn run_command_with_progress(
     drop(rx);
     let _ = reader_thread.join();
     result
+}
+
+fn emit_diagnostic(output: &str, secrets: &[Zeroizing<String>], sink: &mut dyn FnMut(&str)) {
+    let mut text = Zeroizing::new(output.to_string());
+    for secret in secrets {
+        *text = text.replace(secret.as_str(), "[已隐藏凭据]");
+    }
+    sink(&text);
 }
 
 fn prompt_kind(buffer: &str) -> Option<bool> {
@@ -491,6 +519,39 @@ fn ssh_error(output: &str, hop: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_output_includes_stdout_and_stderr_on_failure_and_redacts_secrets() {
+        let mut cmd = CommandBuilder::new("python3");
+        cmd.args([
+            "-c",
+            r#"
+import sys,termios
+attrs=termios.tcgetattr(0); attrs[3] &= ~termios.ECHO; termios.tcsetattr(0,termios.TCSANOW,attrs)
+print('password: ',end='',flush=True)
+secret=input()
+print('TF_READY_test',flush=True)
+print('ordinary stdout',flush=True)
+print('unrecognized failure on stderr',file=sys.stderr,flush=True)
+print('echoed '+secret,flush=True)
+sys.exit(1)
+"#,
+        ]);
+        let mut diagnostic = String::new();
+        let result = run_command_with_diagnostics(
+            cmd,
+            "test",
+            &AtomicBool::new(false),
+            |_| Ok(Some(Zeroizing::new("diagnostic-test-secret".into()))),
+            Duration::from_secs(5),
+            &mut |_| {},
+            &mut |text| diagnostic.push_str(text),
+        );
+        assert!(result.is_err());
+        assert!(diagnostic.contains("ordinary stdout"));
+        assert!(diagnostic.contains("unrecognized failure on stderr"));
+        assert!(!diagnostic.contains("diagnostic-test-secret"));
+        assert!(diagnostic.contains("[已隐藏凭据]"));
+    }
     #[test]
     fn windows_console_sequences_can_split_across_reads() {
         let mut parser = TerminalText::default();
