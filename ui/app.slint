@@ -121,11 +121,12 @@ component FilePane inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "Transfer Files · 双栏文件传输";
+    title: "跃传 · 跨平台多跳文件传输";
+    icon: @image-url("../assets/icons/yuechuan-256.png");
     preferred-width: 1180px;
     preferred-height: 800px;
     min-width: 920px;
-    min-height: 620px;
+    min-height: 700px;
     background: #edf1f3;
     in property <[RemoteTabRow]> tabs;
     in property <int> selected-tab;
@@ -158,6 +159,9 @@ export component AppWindow inherits Window {
     in property <string> status: "准备就绪";
     in property <string> detail;
     in property <string> history;
+    in-out property <string> transfer-log;
+    in-out property <bool> transfer-log-auto-scroll: true;
+    callback clear-transfer-log();
     in-out property <int> setting-target-system: 1;
     in-out property <string> setting-target-identity;
     in-out property <int> setting-cache-policy;
@@ -191,6 +195,19 @@ export component AppWindow inherits Window {
     callback save-settings(string, string, string, string, string, string, string, string);
     callback cancel-settings();
 
+    log-scroll-timer := Timer {
+        interval: 90ms;
+        running: false;
+        triggered => {
+            if (root.transfer-log-auto-scroll) {
+                log-view.content-y = min(0px, log-view.visible-height - log-view.content-height);
+            }
+            self.stop();
+        }
+    }
+    changed transfer-log => { log-scroll-timer.restart(); }
+    changed transfer-log-auto-scroll => { log-scroll-timer.restart(); }
+
     // Used by the X11 native file-drop adapter; coordinates are logical pixels.
     public pure function pane-at(x: float, y: float) -> int {
         if (x >= left-pane.absolute-position.x / 1px && x < (left-pane.absolute-position.x + left-pane.width) / 1px
@@ -201,10 +218,12 @@ export component AppWindow inherits Window {
     }
 
     VerticalLayout {
-        padding: 18px;
-        spacing: 12px;
+        padding: 14px;
+        spacing: 10px;
         HorizontalLayout {
-            Text { text: "TRANSFER FILES"; color: #173b3d; font-size: 23px; font-weight: 800; }
+            spacing: 8px;
+            Text { text: "跃传"; color: #173b3d; font-size: 25px; font-weight: 800; }
+            Text { text: "YUE TRANSFER"; color: #178477; font-size: 11px; font-weight: 700; vertical-alignment: bottom; }
             Rectangle { horizontal-stretch: 1; }
             Button { text: root.remote-reading ? "读取中…" : "读取远程目录"; enabled: root.right-remote && !root.remote-reading && !root.busy; clicked => { root.refresh(1); } }
             Button { text: "远程设置"; enabled: !root.busy && !root.remote-reading; clicked => { root.show-settings(); } }
@@ -280,14 +299,34 @@ export component AppWindow inherits Window {
         Rectangle {
             background: #ffffff;
             border-radius: 8px;
-            min-height: 162px;
-            max-height: 162px;
+            min-height: 150px;
+            max-height: 260px;
+            vertical-stretch: 1;
             VerticalLayout {
-                padding: 12px; spacing: 6px;
+                padding: 10px; spacing: 5px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "传输输出"; color: #173b3d; font-weight: 700; vertical-alignment: center; }
+                    Text { text: "实时来自实际传输；多个标签各自保留输出"; color: #667782; font-size: 11px; vertical-alignment: center; }
+                    Text { text: root.history; visible: root.history != ""; color: #8a5a20; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    CheckBox {
+                        text: "自动滚动";
+                        checked <=> root.transfer-log-auto-scroll;
+                    }
+                    Button { text: "清空"; clicked => { root.clear-transfer-log(); } }
+                }
                 Text { text: root.status; color: #173b3d; font-weight: 600; overflow: elide; }
                 ProgressIndicator { progress: root.progress; }
                 Text { text: root.detail; color: #526570; font-size: 12px; overflow: elide; }
-                TextEdit { text: root.history; read-only: true; font-size: 11px; }
+                log-view := TextEdit {
+                    text: root.transfer-log;
+                    read-only: true;
+                    font-size: 11px;
+                    font-family: "monospace";
+                    wrap: no-wrap;
+                    min-height: 44px;
+                }
             }
         }
     }

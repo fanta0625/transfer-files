@@ -1,11 +1,16 @@
 [Desktop Entry]
 Type=Application
-Name=Transfer Files
-Name[zh_CN]=文件传输
-Comment=Browse and transfer files over SSH
-Comment[zh_CN]=通过 SSH 浏览和传输文件
+Name=跃传
+Name[en]=YueTransfer
+GenericName=跨平台多跳文件传输
+GenericName[en]=Cross-platform multi-hop file transfer
+Comment=Cross-platform multi-hop SSH file transfer client
+Comment[zh_CN]=跨平台多跳 SSH 文件传输客户端
 Exec=transfer-files
-Icon=folder-remote
+Icon=yuechuan
 Terminal=false
-Categories=Network;FileTransfer;
+Categories=Network;FileTransfer;Utility;
+Keywords=SSH;SFTP;SCP;transfer;multi-hop;resume;file;
+Keywords[zh_CN]=SSH;SFTP;文件传输;多跳;跳板;断点续传;密钥;
 StartupNotify=true
+StartupWMClass=transfer-files

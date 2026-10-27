@@ -74,6 +74,8 @@ struct Presentation {
     auth_detail: slint::SharedString,
     auth_visible: bool,
     auth_host_key: bool,
+    transfer_log: slint::SharedString,
+    transfer_log_auto_scroll: bool,
 }
 impl Default for Presentation {
     fn default() -> Self {
@@ -89,6 +91,8 @@ impl Default for Presentation {
             auth_detail: "".into(),
             auth_visible: false,
             auth_host_key: false,
+            transfer_log: "".into(),
+            transfer_log_auto_scroll: true,
         }
     }
 }
@@ -106,6 +110,8 @@ impl Presentation {
             auth_detail: ui.get_auth_detail(),
             auth_visible: ui.get_auth_visible(),
             auth_host_key: ui.get_auth_host_key(),
+            transfer_log: ui.get_transfer_log(),
+            transfer_log_auto_scroll: ui.get_transfer_log_auto_scroll(),
         }
     }
     fn apply(&self, ui: &AppWindow) {
@@ -120,6 +126,8 @@ impl Presentation {
         ui.set_auth_detail(self.auth_detail.clone());
         ui.set_auth_visible(self.auth_visible);
         ui.set_auth_host_key(self.auth_host_key);
+        ui.set_transfer_log(self.transfer_log.clone());
+        ui.set_transfer_log_auto_scroll(self.transfer_log_auto_scroll);
         // Never copy a typed password between views or tabs.
         ui.set_auth_secret("".into());
     }
@@ -164,6 +172,8 @@ impl Tab {
             busy: false,
             worker: None,
             external: None,
+            transfer_log: Vec::new(),
+            transfer_last_note: String::new(),
         }));
         Self {
             id,
@@ -655,6 +665,49 @@ mod tests {
         workspace.borrow_mut().select(&ui, 1);
         assert_eq!(ui.get_right_path(), "C:/tab-1");
         assert_eq!(ui.get_progress(), 0.75);
+        #[cfg(target_os = "linux")]
+        {
+            use remote::transfer::{TransferState, TransferUpdate};
+            let update = |file: &str, done: u64| TransferUpdate {
+                state: TransferState::Running,
+                file: file.into(),
+                file_done: done,
+                file_total: 100,
+                done,
+                total: 100,
+                files_done: 0,
+                files_total: 1,
+                edge: 1,
+                edges: 1,
+                speed: 1024.0,
+                eta: Some(1),
+            };
+            // The active tab is beta here; background alpha output must not leak.
+            states[1]
+                .borrow()
+                .tx
+                .send(Event::RemoteProgress(1, update("beta.bin", 80)))
+                .unwrap();
+            workspace.borrow_mut().tick(&ui);
+            assert!(ui.get_transfer_log().contains("beta.bin"));
+            workspace.borrow_mut().select(&ui, 0);
+            states[0]
+                .borrow()
+                .tx
+                .send(Event::RemoteProgress(1, update("alpha.bin", 50)))
+                .unwrap();
+            workspace.borrow_mut().tick(&ui);
+            assert!(ui.get_transfer_log().contains("alpha.bin"));
+            assert!(!ui.get_transfer_log().contains("beta.bin"));
+            ui.invoke_clear_transfer_log();
+            assert!(ui.get_transfer_log().is_empty());
+            workspace.borrow_mut().select(&ui, 1);
+            assert!(ui.get_transfer_log().contains("beta.bin"));
+            workspace.borrow_mut().select(&ui, 0);
+            assert!(ui.get_transfer_log().is_empty());
+            // Leave beta selected for the authentication checks below.
+            workspace.borrow_mut().select(&ui, 1);
+        }
         assert_eq!(
             states[0]
                 .borrow()

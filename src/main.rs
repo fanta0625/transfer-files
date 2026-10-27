@@ -41,6 +41,8 @@ enum Event {
     RemotePrompt(u64, remote::Prompt, Sender<remote::Answer>),
     Progress(files::Progress),
     Finished(files::Report),
+    #[cfg(target_os = "linux")]
+    RemoteProgress(u64, remote::transfer::TransferUpdate),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RemoteTransferFinished(u64, Result<String, String>),
 }
@@ -61,6 +63,8 @@ struct State {
     worker: Option<thread::JoinHandle<()>>,
     // Native winit file drops arrive one path at a time. Coalesce into one batch.
     external: Option<(Instant, PathBuf, Vec<PathBuf>)>,
+    transfer_log: Vec<String>,
+    transfer_last_note: String,
 }
 
 type Shared = Rc<RefCell<State>>;
@@ -246,6 +250,186 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
     ui.set_setting_windows_root(config.windows_root.clone().into());
 }
 
+#[cfg(target_os = "linux")]
+fn transfer_percent(done: u64, total: u64) -> u64 {
+    done.saturating_mul(100).checked_div(total).unwrap_or(100)
+}
+
+#[cfg(target_os = "linux")]
+fn speed_label(bytes_per_second: f64) -> String {
+    if bytes_per_second <= 0.0 {
+        "—".into()
+    } else {
+        format!("{}/s", files::size_label(bytes_per_second.round() as u64))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn eta_label(seconds: Option<u64>) -> String {
+    match seconds {
+        None => "ETA --:--".into(),
+        Some(0) => "ETA 00:00".into(),
+        Some(seconds) => {
+            let hours = seconds / 3600;
+            let minutes = seconds % 3600 / 60;
+            let seconds = seconds % 60;
+            if hours > 0 {
+                format!("ETA {hours}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("ETA {minutes:02}:{seconds:02}")
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn transfer_note(update: &remote::transfer::TransferUpdate) -> String {
+    use remote::transfer::TransferState;
+    let percent = transfer_percent(update.file_done, update.file_total);
+    match update.state {
+        TransferState::Started => format!(
+            "开始传输 · {} 个文件 · {}",
+            update.files_total,
+            files::size_label(update.total)
+        ),
+        TransferState::Stage => format!(
+            "第 {}/{} 段 · {} 个文件 · {}",
+            update.edge,
+            update.edges,
+            update.files_total,
+            files::size_label(update.total)
+        ),
+        TransferState::Resumed => format!(
+            "续传 · {} · 已有 {}/{}",
+            update.file,
+            files::size_label(update.file_done),
+            files::size_label(update.file_total)
+        ),
+        TransferState::Running => format!(
+            "{} · {}% · {}/{} · {} · {}",
+            update.file,
+            percent,
+            files::size_label(update.file_done),
+            files::size_label(update.file_total),
+            speed_label(update.speed),
+            eta_label(update.eta)
+        ),
+        TransferState::Done => format!(
+            "成功 · {} · {}",
+            update.file,
+            files::size_label(update.file_total)
+        ),
+        TransferState::Skipped => format!("跳过 · {} · 已存在且校验一致", update.file),
+        TransferState::Failed => format!("失败 · {} · 传输中断", update.file),
+    }
+}
+
+fn push_transfer_log(ui: &AppWindow, state: &Shared, note: &str) {
+    let note = note.trim();
+    if note.is_empty() {
+        return;
+    }
+    let mut state = state.borrow_mut();
+    if state.transfer_last_note == note {
+        return;
+    }
+    state.transfer_last_note = note.into();
+    state.transfer_log.push(format!(
+        "[{}] {note}",
+        chrono::Utc::now().format("%H:%M:%S")
+    ));
+    if state.transfer_log.len() > 600 {
+        state.transfer_log.drain(..100);
+    }
+    ui.set_transfer_log(state.transfer_log.join("\n").into());
+}
+
+#[cfg(target_os = "linux")]
+fn paint_transfer_update(
+    ui: &AppWindow,
+    state: &Shared,
+    update: &remote::transfer::TransferUpdate,
+) {
+    use remote::transfer::TransferState;
+    let fraction = if update.total > 0 {
+        update.done as f64 / update.total as f64
+    } else {
+        0.0
+    };
+    ui.set_progress(fraction.clamp(0.0, 1.0) as f32);
+    let head = format!(
+        "第 {}/{} 段 · 文件 {}/{}",
+        update.edge, update.edges, update.files_done, update.files_total
+    );
+    match update.state {
+        TransferState::Started => {
+            ui.set_status("准备传输…".into());
+            ui.set_detail(
+                format!(
+                    "共 {} 个文件，{}；实际字节进度来自 SFTP 传输",
+                    update.files_total,
+                    files::size_label(update.total)
+                )
+                .into(),
+            );
+        }
+        TransferState::Stage => {
+            ui.set_status(format!("校验并准备 · {head}").into());
+            ui.set_detail(
+                format!(
+                    "{} 个文件 · {}",
+                    update.files_total,
+                    files::size_label(update.total)
+                )
+                .into(),
+            );
+        }
+        TransferState::Running => {
+            let percent = transfer_percent(update.file_done, update.file_total);
+            ui.set_status(format!("传输中 · {head}").into());
+            ui.set_detail(
+                format!(
+                    "{} · {}% · {}/{} · {} · {}",
+                    update.file,
+                    percent,
+                    files::size_label(update.file_done),
+                    files::size_label(update.file_total),
+                    speed_label(update.speed),
+                    eta_label(update.eta)
+                )
+                .into(),
+            );
+        }
+        TransferState::Resumed => {
+            ui.set_status(format!("续传 · {head}").into());
+            ui.set_detail(
+                format!(
+                    "{} · 已有 {}/{}",
+                    update.file,
+                    files::size_label(update.file_done),
+                    files::size_label(update.file_total)
+                )
+                .into(),
+            );
+        }
+        TransferState::Done => {
+            ui.set_status(format!("文件成功 · {head}").into());
+            ui.set_detail(
+                format!("{} · {}", update.file, files::size_label(update.file_total)).into(),
+            );
+        }
+        TransferState::Skipped => {
+            ui.set_status(format!("已跳过 · {head}").into());
+            ui.set_detail(format!("{} · 已存在且校验一致", update.file).into());
+        }
+        TransferState::Failed => {
+            ui.set_status(format!("传输失败 · {head}").into());
+            ui.set_detail(format!("{} · 传输中断", update.file).into());
+        }
+    }
+    push_transfer_log(ui, state, &transfer_note(update));
+}
+
 fn ask_remote(
     tx: &Sender<Event>,
     generation: u64,
@@ -424,7 +608,7 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
     ui.set_status(format!("正在下载 {} 个项目…", sources.len()).into());
     let worker = thread::spawn(move || {
         let result = (|| {
-            for (index, source) in sources.iter().enumerate() {
+            for source in &sources {
                 let name =
                     remote::file_name_for(config.target_options.os, &source.to_string_lossy())
                         .map_err(|e| e.to_string())?;
@@ -434,15 +618,12 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
                     &name,
                     &target,
                     &cancel,
+                    |update| {
+                        let _ = tx.send(Event::RemoteProgress(generation, update));
+                    },
                     |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
                 )
                 .map_err(|e| e.to_string())?;
-                let _ = tx.send(Event::Progress(files::Progress {
-                    files: index + 1,
-                    total_files: sources.len(),
-                    current: name,
-                    ..Default::default()
-                }));
             }
             Ok("下载完成，SSH 已断开".into())
         })();
@@ -487,7 +668,7 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
     );
     let worker = thread::spawn(move || {
         let result = (|| {
-            for (index, source) in sources.iter().enumerate() {
+            for source in &sources {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("上传已取消，SSH 已断开".into());
                 }
@@ -496,15 +677,12 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
                     source,
                     &target.to_string_lossy(),
                     &cancel,
+                    |update| {
+                        let _ = tx.send(Event::RemoteProgress(generation, update));
+                    },
                     |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
                 )
                 .map_err(|e| e.to_string())?;
-                let _ = tx.send(Event::Progress(files::Progress {
-                    files: index + 1,
-                    total_files: sources.len(),
-                    current: source.display().to_string(),
-                    ..Default::default()
-                }));
             }
             Ok("上传完成，SSH 已断开".into())
         })();
@@ -854,6 +1032,17 @@ fn wire(ui: &AppWindow, state: &Shared) {
     });
     let weak = ui.as_weak();
     let shared = state.clone();
+    ui.on_clear_transfer_log(move || {
+        let ui = weak.unwrap();
+        {
+            let mut state = shared.borrow_mut();
+            state.transfer_log.clear();
+            state.transfer_last_note.clear();
+        }
+        ui.set_transfer_log("".into());
+    });
+    let weak = ui.as_weak();
+    let shared = state.clone();
     ui.on_cancel(move || {
         shared.borrow().cancel.store(true, Ordering::Relaxed);
         shared.borrow().remote_cancel.store(true, Ordering::Relaxed);
@@ -1031,6 +1220,13 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                 );
                 ui.set_detail(progress.current.into());
             }
+            #[cfg(target_os = "linux")]
+            Event::RemoteProgress(generation, update) => {
+                if generation != state.borrow().panes[1].generation {
+                    continue;
+                }
+                paint_transfer_update(ui, state, &update);
+            }
             Event::Finished(report) => {
                 let worker = {
                     let mut state = state.borrow_mut();
@@ -1095,12 +1291,14 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
                         ui.set_status(message.into());
                         ui.set_detail("文件或目录传输完成；点击刷新更新远程目录快照。".into());
                         ui.set_history("连接链传输和暂存清理已完成，本次 SSH 会话已关闭。".into());
+                        push_transfer_log(ui, state, "完成 · 校验与暂存清理完成，SSH 已断开");
                     }
                     Err(error) => {
                         state.borrow().credentials.lock().unwrap().clear();
                         ui.set_status("远程传输未完成，SSH 已断开".into());
                         ui.set_history(error.clone().into());
-                        ui.set_detail(error.into());
+                        ui.set_detail(error.clone().into());
+                        push_transfer_log(ui, state, &format!("失败 · {error}"));
                     }
                 }
                 paint_pane(ui, state, 1);
@@ -1246,6 +1444,8 @@ mod ui_tests {
             busy: false,
             worker: None,
             external: None,
+            transfer_log: Vec::new(),
+            transfer_last_note: String::new(),
         }));
         wire(&ui, &state);
         navigate(&ui, &state, 0, left.clone());
@@ -1473,6 +1673,8 @@ mod ui_tests {
         snapshot(&ui, "remote-settings-small.png");
         ui.window().set_size(slint::LogicalSize::new(1180.0, 800.0));
         ui.invoke_cancel_settings();
+        ui.window().set_size(LogicalSize::new(920.0, 700.0));
+        snapshot(&ui, "prototype-small-window.png");
         ui.hide().unwrap();
     }
 }

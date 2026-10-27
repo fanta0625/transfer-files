@@ -43,17 +43,35 @@ exec /usr/lib/transfer-files/transfer-files "$@"
 EOF
 chmod 755 "$PACKAGE/usr/bin/transfer-files"
 install -Dm644 packaging/transfer-files.desktop "$PACKAGE/usr/share/applications/transfer-files.desktop"
+install -Dm644 assets/icons/yuechuan.svg "$PACKAGE/usr/share/icons/hicolor/scalable/apps/yuechuan.svg"
+for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "assets/icons/yuechuan-$size.png" \
+        "$PACKAGE/usr/share/icons/hicolor/${size}x${size}/apps/yuechuan.png"
+done
+install -Dm644 assets/icons/yuechuan-256.png "$PACKAGE/usr/share/pixmaps/yuechuan.png"
+cat > "$PACKAGE/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+fi
+EOF
+cp "$PACKAGE/DEBIAN/postinst" "$PACKAGE/DEBIAN/postrm"
+chmod 755 "$PACKAGE/DEBIAN/postinst" "$PACKAGE/DEBIAN/postrm"
 # Resolve linked library versions on the build machine. Slint also loads these
 # desktop libraries dynamically, so they and OpenSSH are listed explicitly.
 cat > "$STAGE/debian/control" <<'EOF'
 Source: transfer-files
 Section: utils
 Priority: optional
-Maintainer: Transfer Files contributors <noreply@example.com>
+Maintainer: YueTransfer contributors <noreply@example.com>
 
 Package: transfer-files
 Architecture: any
-Description: SSH file transfer client
+Description: YueTransfer cross-platform multi-hop SSH file transfer client
 EOF
 DEPENDS="$(cd "$STAGE" && dpkg-shlibdeps -O -e"$PACKAGE/usr/lib/transfer-files/transfer-files")"
 DEPENDS="${DEPENDS#shlibs:Depends=}"
@@ -65,11 +83,13 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Maintainer: Transfer Files contributors <noreply@example.com>
+Maintainer: YueTransfer contributors <noreply@example.com>
 Installed-Size: $SIZE
 Depends: $DEPENDS, python3, openssh-client, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
-Description: GUI file transfer client over SSH
- Browse Windows directories and transfer files through optional SSH hops.
+Description: 跃传 (YueTransfer) - cross-platform multi-hop SSH file transfer client
+ Dual-pane SSH file browser and transfer client for Linux desktops.
+ Supports mixed Windows/Linux hops, independent tabs, verified resumable
+ transfers, and password or SSH-key authentication.
 EOF
 DEB="$OUTPUT_DIR/transfer-files_${VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$PACKAGE" "$DEB"

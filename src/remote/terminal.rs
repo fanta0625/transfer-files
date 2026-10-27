@@ -215,8 +215,22 @@ pub fn run_command(
     cmd: CommandBuilder,
     token: &str,
     cancel: &AtomicBool,
+    ask: impl FnMut(Prompt) -> io::Result<Answer>,
+    timeout: Duration,
+) -> io::Result<String> {
+    run_command_with_progress(cmd, token, cancel, ask, timeout, &mut |_| {})
+}
+
+/// Like [`run_command`], but forwards terminal text produced after the remote
+/// helper is ready. The transfer layer uses this to read the real SFTP progress
+/// meter; the text is never logged or shown verbatim.
+pub fn run_command_with_progress(
+    cmd: CommandBuilder,
+    token: &str,
+    cancel: &AtomicBool,
     mut ask: impl FnMut(Prompt) -> io::Result<Answer>,
     timeout: Duration,
+    on_text: &mut dyn FnMut(&str),
 ) -> io::Result<String> {
     let initial_hop = cmd
         .get_env("TF_NODE_LABEL")
@@ -232,7 +246,9 @@ pub fn run_command(
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 40,
-            cols: 4096,
+            // Wide enough for long UTF-8 file names in the SFTP progress meter,
+            // but bounded so carriage-return-updated meter lines stay small.
+            cols: 1024,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -324,6 +340,9 @@ pub fn run_command(
                         || prompt_buffer.contains(&format!("TF_RPC_{token}_BEGIN"))
                     {
                         data_started = true;
+                    }
+                    if data_started {
+                        on_text(&text);
                     }
                     if !data_started && let Some(host_key) = prompt_kind(&prompt_buffer) {
                         attempts += 1;

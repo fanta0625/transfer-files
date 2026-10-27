@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
-description = "Dual-pane client for two-stage SSH file browsing and transfers"
+description = "跃传 (YueTransfer) - cross-platform multi-hop SSH file transfer client"
 build = "build.rs"
 
 [dependencies]
