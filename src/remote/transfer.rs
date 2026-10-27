@@ -625,12 +625,13 @@ impl<F: FnMut(Prompt) -> io::Result<Answer>> Session<'_, '_, F> {
         let mut batch = String::new();
         let mut active = Vec::new();
         for item in planned {
-            batch.push_str(&format!(
-                "{} {} {}\n",
+            batch.push_str(&sftp_transfer_command(
                 item.operation,
-                sftp_quote(&item.source.path)?,
-                sftp_quote(&item.destination.path)?
-            ));
+                &item.source.path,
+                &item.destination.path,
+                download,
+                self.nodes[remote].options.os,
+            )?);
             active.push(item.index);
             if batch.len() >= 2048 {
                 self.batch(runner, remote, &batch, &mut meter, &active, report)?;
@@ -680,6 +681,43 @@ fn parent(path: &str) -> io::Result<&str> {
         parent
     })
 }
+/// The remote operand uses the SFTP namespace, while the local operand uses
+/// the runner's native filesystem namespace. In particular a POSIX sftp client
+/// treats `E:/file` as relative and prepends the server's login directory.
+fn sftp_transfer_command(
+    operation: &str,
+    source: &str,
+    destination: &str,
+    download: bool,
+    remote_os: RemoteOs,
+) -> io::Result<String> {
+    let remote_path = if download { source } else { destination };
+    let remote_path = if remote_os == RemoteOs::Windows {
+        let path = remote_path.replace('\\', "/");
+        let bytes = path.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            if bytes.get(2) != Some(&b'/') {
+                return Err(io::Error::other("Windows SFTP 路径必须使用完整盘符路径"));
+            }
+            format!("/{path}")
+        } else {
+            path
+        }
+    } else {
+        remote_path.to_string()
+    };
+    let (source, destination) = if download {
+        (remote_path.as_str(), destination)
+    } else {
+        (source, remote_path.as_str())
+    };
+    Ok(format!(
+        "{operation} {} {}\n",
+        sftp_quote(source)?,
+        sftp_quote(destination)?
+    ))
+}
+
 fn sftp_quote(path: &str) -> io::Result<String> {
     if path.chars().any(char::is_control) {
         return Err(io::Error::other("SFTP 路径不能包含控制字符"));
@@ -909,6 +947,181 @@ pub fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_sftp_drive_paths_are_absolute_only_on_the_remote_side() {
+        let windows_file = "E:/projects/宣传素材/成片/视频.mp4";
+        for operation in ["get", "reget"] {
+            assert_eq!(
+                sftp_transfer_command(
+                    operation,
+                    windows_file,
+                    "/home/fans/payload",
+                    true,
+                    RemoteOs::Windows
+                )
+                .unwrap(),
+                format!(
+                    "{operation} \"/E:/projects/宣传素材/成片/视频.mp4\" \"/home/fans/payload\"\n"
+                )
+            );
+        }
+        for operation in ["put", "reput"] {
+            assert_eq!(
+                sftp_transfer_command(
+                    operation,
+                    "/home/fans/payload",
+                    windows_file,
+                    false,
+                    RemoteOs::Windows
+                )
+                .unwrap(),
+                format!(
+                    "{operation} \"/home/fans/payload\" \"/E:/projects/宣传素材/成片/视频.mp4\"\n"
+                )
+            );
+        }
+        // A Windows intermediary is also an SFTP client. Its local operand
+        // must remain a native drive path, even when the server is Windows.
+        assert_eq!(
+            sftp_transfer_command(
+                "get",
+                "E:\\资料\\a b.mp4",
+                "C:/stage/payload",
+                true,
+                RemoteOs::Windows
+            )
+            .unwrap(),
+            "get \"/E:/资料/a b.mp4\" \"C:/stage/payload\"\n"
+        );
+        assert_eq!(
+            sftp_transfer_command(
+                "put",
+                "C:/stage/payload",
+                "/home/user/payload",
+                false,
+                RemoteOs::Linux
+            )
+            .unwrap(),
+            "put \"C:/stage/payload\" \"/home/user/payload\"\n"
+        );
+        assert_eq!(
+            sftp_transfer_command(
+                "get",
+                "/E:/资料/a.mp4",
+                "/tmp/payload",
+                true,
+                RemoteOs::Windows
+            )
+            .unwrap(),
+            "get \"/E:/资料/a.mp4\" \"/tmp/payload\"\n"
+        );
+        assert!(
+            sftp_transfer_command("get", "E:relative", "/tmp/payload", true, RemoteOs::Windows)
+                .is_err()
+        );
+        assert_eq!(
+            sftp_transfer_command(
+                "get",
+                "/home/user/E:/a.mp4",
+                "/tmp/payload",
+                true,
+                RemoteOs::Linux
+            )
+            .unwrap(),
+            "get \"/home/user/E:/a.mp4\" \"/tmp/payload\"\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires WSL and TF_TEST_WINDOWS_SFTP_SERVER pointing to Windows sftp-server.exe"]
+    fn real_windows_sftp_drive_paths_and_resume() {
+        use std::process::Command;
+        let server = std::env::var("TF_TEST_WINDOWS_SFTP_SERVER").unwrap();
+        let root = std::env::current_dir().unwrap().join("target/qa");
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir_in(root).unwrap();
+        let source = temp.path().join("宣传素材 空格.mp4");
+        let uploaded = temp.path().join("上传结果.mp4");
+        let downloaded = temp.path().join("download.mp4");
+        let content = b"verified Windows SFTP transfer and resume";
+        std::fs::write(&source, content).unwrap();
+        let windows_path = |path: &Path| {
+            let output = Command::new("wslpath")
+                .args(["-w"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .replace('\\', "/")
+        };
+        let source_remote = windows_path(&source);
+        let uploaded_remote = windows_path(&uploaded);
+        let batch_path = temp.path().join("commands");
+        let run = |batch: &str| {
+            std::fs::write(&batch_path, batch).unwrap();
+            Command::new("sftp")
+                .arg("-D")
+                .arg(&server)
+                .arg("-b")
+                .arg(&batch_path)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap()
+        };
+        // Reproduce the reported regression before checking the corrected paths.
+        let old = run(&format!(
+            "get {} {}\n",
+            sftp_quote(&source_remote).unwrap(),
+            sftp_quote(&downloaded.to_string_lossy()).unwrap()
+        ));
+        assert!(
+            !old.status.success(),
+            "drive path unexpectedly accepted as absolute"
+        );
+        for operation in ["get", "reget"] {
+            if operation == "reget" {
+                std::fs::write(&downloaded, &content[..8]).unwrap();
+            }
+            let batch = sftp_transfer_command(
+                operation,
+                &source_remote,
+                &downloaded.to_string_lossy(),
+                true,
+                RemoteOs::Windows,
+            )
+            .unwrap();
+            let output = run(&batch);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&downloaded).unwrap(), content);
+        }
+        for operation in ["put", "reput"] {
+            if operation == "reput" {
+                std::fs::write(&uploaded, &content[..8]).unwrap();
+            }
+            let batch = sftp_transfer_command(
+                operation,
+                &source.to_string_lossy(),
+                &uploaded_remote,
+                false,
+                RemoteOs::Windows,
+            )
+            .unwrap();
+            let output = run(&batch);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&uploaded).unwrap(), content);
+        }
+    }
     #[test]
     fn diagnostics_keep_unrecognized_output_and_hide_internal_frames_and_authentication() {
         let text = "TF_READY_test\r\nordinary stdout\r\nunrecognized failure\r\nPermission denied (publickey,password).\r\npassword: hidden\r\nTF_RPC_test_BEGIN\r\ncHJpdmF0ZQ==\r\nTF_RPC_test_END\r\nafter frame\r\n";

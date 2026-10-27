@@ -41,6 +41,8 @@ Linux 客户端支持直连、Linux / Windows 混合中转，目标可为 Linux 
 
 ## 如何恢复中断
 
+Windows 路径在界面中仍填写 `E:/目录/文件`。传输时程序只把 SFTP 远端的盘符路径转换成 `/E:/目录/文件`，避免 Linux 的 SFTP 客户端把它拼到 Windows 登录目录下；中转节点上的本地路径保持原格式。若旧版日志出现 `/C:/Users/用户名/E:/...`，请升级程序后重试，不需要移动文件或重配 SFTP 服务。
+
 重新启动程序也可以恢复：选择相同源文件/目录、连接配置和目标目录，再次上传或下载即可。没有后台自动重连、恢复任务列表或额外“继续”按钮。
 
 1. 读取源清单，计算每个文件的 SHA-256。源内容、路径、连接链和传输方向共同决定任务标识。
@@ -74,3 +76,10 @@ bash scripts/test-transfer.sh
 ```
 
 最后一项需要 OpenSSH `sftp-server`，可用 `TF_TEST_SFTP_SERVER=/path/to/sftp-server` 指定。测试以隔离的本地 SSH 替身运行真实 SFTP，不连接用户主机，不读写用户凭据；覆盖直连、多节点、上传下载、部分文件续传、错误前缀拒绝和发布冲突。它不是实际 Windows/Linux 混合网络部署的验收证明。
+
+在 WSL 中还可直接测试 Linux SFTP 客户端与 Windows SFTP 服务程序的盘符路径、中文及空格文件名、上传下载和双向续传（通过标准输入输出通信，不开放网络端口；项目目录需位于 Windows 磁盘）：
+
+```bash
+TF_TEST_WINDOWS_SFTP_SERVER=/mnt/c/Windows/System32/OpenSSH/sftp-server.exe \
+  cargo test --locked real_windows_sftp_drive_paths_and_resume -- --ignored
+```
