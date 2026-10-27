@@ -61,12 +61,42 @@ pub fn parse(output: &str, token: &str) -> io::Result<Value> {
     let bytes = STANDARD.decode(data).map_err(io::Error::other)?;
     let answer: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if answer["ok"] != true {
-        return Err(io::Error::other(
-            answer["error"]
-                .as_str()
-                .unwrap_or("远端操作失败")
-                .to_string(),
-        ));
+        let mut message = answer["error"]
+            .as_str()
+            .unwrap_or("远端操作失败")
+            .to_string();
+        if message.starts_with("SFTP failed with status ") {
+            // Publish fixed diagnostic labels only, never the terminal transcript:
+            // it can contain authentication prompts, commands or private paths.
+            let transcript = output
+                .split(&begin)
+                .next()
+                .unwrap_or_default()
+                .to_lowercase();
+            let diagnostics = [
+                (
+                    "no such file",
+                    "SFTP 找不到文件或目录（包括远端 SFTP 路径映射）",
+                ),
+                ("permission denied", "SFTP 拒绝访问或认证失败"),
+                ("invalid command", "SFTP 不支持批处理中的命令"),
+                ("subsystem request failed", "远端 SFTP 子系统启动失败"),
+                ("connection refused", "SSH 连接被拒绝"),
+                ("connection closed", "SSH/SFTP 连接被关闭"),
+                ("connection reset", "SSH/SFTP 连接被重置"),
+                ("host key verification failed", "SSH 主机密钥验证失败"),
+                ("no space left", "目标磁盘空间不足"),
+                ("disk quota exceeded", "目标磁盘配额已用尽"),
+                ("not a regular file", "SFTP 源路径不是普通文件"),
+            ];
+            for (pattern, label) in diagnostics {
+                if transcript.contains(pattern) {
+                    message.push_str("；");
+                    message.push_str(label);
+                }
+            }
+        }
+        return Err(io::Error::other(message));
     }
     Ok(answer["value"].clone())
 }
@@ -92,6 +122,20 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    #[test]
+    fn sftp_errors_explain_failure_without_exposing_terminal_text() {
+        let payload = STANDARD.encode(
+            serde_json::to_vec(&json!({"ok":false,"error":"SFTP failed with status 1"})).unwrap(),
+        );
+        let output = format!(
+            "private password prompt\nremote open private-file: No such file or directory\nTF_RPC_test_BEGIN\n{payload}\nTF_RPC_test_END\n"
+        );
+        let error = parse(&output, "test").unwrap_err().to_string();
+        assert!(error.contains("找不到文件或目录"));
+        assert!(!error.contains("private"));
+        assert!(!error.contains("password"));
+    }
 
     fn execute(request: Value) -> io::Result<Value> {
         #[cfg(windows)]
