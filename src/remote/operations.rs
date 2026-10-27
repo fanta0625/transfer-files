@@ -91,14 +91,77 @@ pub fn parse(output: &str, token: &str) -> io::Result<Value> {
             ];
             for (pattern, label) in diagnostics {
                 if transcript.contains(pattern) {
-                    message.push_str("；");
+                    message.push('；');
                     message.push_str(label);
                 }
+            }
+            let details = sftp_error_details(output.split(&begin).next().unwrap_or_default());
+            if !details.is_empty() {
+                message.push_str("；SFTP 原因：");
+                message.push_str(&details.join(" | "));
+            } else if message == answer["error"].as_str().unwrap_or_default() {
+                message.push_str("；未捕获到可识别的 SFTP 错误，请检查连接发起节点上的 OpenSSH/SFTP 版本及服务端日志");
             }
         }
         return Err(io::Error::other(message));
     }
     Ok(answer["value"].clone())
+}
+
+/// Keep recognized SFTP diagnostics, not arbitrary terminal output. In
+/// particular `File "..." not found.` is different from `No such file` and
+/// previously disappeared completely behind the generic exit status.
+fn sftp_error_details(output: &str) -> Vec<String> {
+    let mut details = Vec::new();
+    for line in output.split(['\r', '\n']).map(str::trim) {
+        let lower = line.to_lowercase();
+        if line.is_empty()
+            || line.chars().count() > 2048
+            || lower.contains("password")
+            || lower.contains("passphrase")
+            || lower.contains("private key")
+            || lower.contains("identityfile")
+            || lower.contains("tf_")
+            || lower.starts_with("sftp>")
+        {
+            continue;
+        }
+        let recognized = [
+            "couldn't ",
+            "cannot ",
+            "can't ",
+            "failed to ",
+            "unable to ",
+            "invalid command",
+            "unknown command",
+            "unsupported command",
+            "received message too long",
+            "bad packet",
+            "message too long",
+            "subsystem request failed",
+            "connection ",
+            "ssh:",
+            "sftp:",
+            "remote open(",
+            "remote stat(",
+            "remote readdir(",
+            "remote mkdir(",
+            "dest open(",
+            "stat ",
+            "open ",
+            "realpath ",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+            || (lower.starts_with("file ") && lower.ends_with("not found."));
+        if recognized && !details.iter().any(|old| old == line) {
+            details.push(line.to_string());
+            if details.len() == 4 {
+                break;
+            }
+        }
+    }
+    details
 }
 
 #[cfg(target_os = "linux")]
@@ -135,6 +198,26 @@ mod tests {
         assert!(error.contains("找不到文件或目录"));
         assert!(!error.contains("private"));
         assert!(!error.contains("password"));
+    }
+
+    #[test]
+    fn sftp_native_errors_survive_without_logging_commands_or_authentication() {
+        let payload = STANDARD.encode(
+            serde_json::to_vec(&json!({"ok":false,"error":"SFTP failed with status 1"})).unwrap(),
+        );
+        for diagnostic in [
+            "File \"E:/资料/视频.mp4\" not found.",
+            "Couldn't canonicalize: Failure",
+            "Received message too long 12345",
+            "Invalid command.",
+        ] {
+            let output = format!(
+                "sftp> get secret-path\npassword: secret\nEnter passphrase for key secret:\n{diagnostic}\nTF_RPC_test_BEGIN\n{payload}\nTF_RPC_test_END\n"
+            );
+            let error = parse(&output, "test").unwrap_err().to_string();
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("secret"));
+        }
     }
 
     fn execute(request: Value) -> io::Result<Value> {

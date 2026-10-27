@@ -1033,6 +1033,26 @@ mod tests {
                 ask,
                 token: "resume-test".into(),
             };
+            // Exercise the entire PTY/helper/framed-error path with a real SFTP
+            // failure, rather than only testing fabricated terminal messages.
+            let missing = temp.path().join("不存在的源文件.mp4");
+            let error = session
+                .batch(
+                    None,
+                    0,
+                    &format!(
+                        "get {} {}\n",
+                        sftp_quote(&missing.to_string_lossy()).unwrap(),
+                        sftp_quote(&temp.path().join("unused").to_string_lossy()).unwrap(),
+                    ),
+                    &mut Meter::new(Vec::new(), 1, 1),
+                    &[],
+                    &mut |_| {},
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("SFTP 原因："), "{error}");
+            assert!(error.contains("not found"), "{error}");
             let src = Location {
                 node: None,
                 path: source.join("a [b]*? ' \"文件.txt").display().to_string(),
