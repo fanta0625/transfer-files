@@ -52,6 +52,25 @@ pub struct CredentialCache {
     policy: crate::config::CachePolicy,
 }
 impl CredentialCache {
+    /// Keep currently valid credentials for one active transfer, including its
+    /// verification, publication and cleanup connections. Never persist them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn for_transfer(&mut self) -> Self {
+        self.expire();
+        let policy = if self.policy == crate::config::CachePolicy::Once {
+            crate::config::CachePolicy::Once
+        } else {
+            crate::config::CachePolicy::Session
+        };
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .map(|(key, (value, _))| (key.clone(), (value.clone(), None)))
+                .collect(),
+            policy,
+        }
+    }
     pub fn set_policy(&mut self, policy: crate::config::CachePolicy) {
         if self.policy != policy {
             self.clear();
@@ -177,6 +196,33 @@ pub fn parent_path(path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transfer_credentials_survive_shared_expiry_but_exclude_expired_entries() {
+        let mut cache = CredentialCache::default();
+        cache.put("active", Zeroizing::new("secret".into()));
+        cache.put("expired", Zeroizing::new("old".into()));
+        cache.entries.get_mut("expired").unwrap().1 = Some(std::time::Instant::now());
+        let mut task = cache.for_transfer();
+        cache.entries.get_mut("active").unwrap().1 = Some(std::time::Instant::now());
+        cache.expire();
+        assert!(cache.get("active").is_none());
+        assert_eq!(task.get("active").unwrap().as_str(), "secret");
+        assert!(task.get("expired").is_none());
+        // A password supplied after the transfer starts also lasts for the task.
+        task.put("new-hop", Zeroizing::new("new".into()));
+        assert!(task.entries["new-hop"].1.is_none());
+        assert!(cache.get("new-hop").is_none());
+    }
+
+    #[test]
+    fn transfer_credentials_respect_no_cache_policy() {
+        let mut cache = CredentialCache::default();
+        cache.set_policy(crate::config::CachePolicy::Once);
+        let mut task = cache.for_transfer();
+        task.put("node", Zeroizing::new("secret".into()));
+        assert!(task.get("node").is_none());
+    }
+
     #[test]
     fn cache_policies_and_linux_paths() {
         use crate::config::{CachePolicy, RemoteOs};

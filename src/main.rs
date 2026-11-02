@@ -317,7 +317,7 @@ fn transfer_note(update: &remote::transfer::TransferUpdate) -> String {
             eta_label(update.eta)
         ),
         TransferState::Done => format!(
-            "成功 · {} · {}",
+            "数据已传完，待校验 · {} · {}",
             update.file,
             files::size_label(update.file_total)
         ),
@@ -421,7 +421,7 @@ fn paint_transfer_update(
             );
         }
         TransferState::Done => {
-            ui.set_status(format!("文件成功 · {head}").into());
+            ui.set_status(format!("数据已传完，待校验 · {head}").into());
             ui.set_detail(
                 format!("{} · {}", update.file, files::size_label(update.file_total)).into(),
             );
@@ -438,6 +438,36 @@ fn paint_transfer_update(
     push_transfer_log(ui, state, &transfer_note(update));
 }
 
+fn credential_key(prompt: &remote::Prompt) -> Option<String> {
+    match prompt {
+        remote::Prompt::Secret { hop } => Some(hop.clone()),
+        remote::Prompt::KeyPassphrase { hop, key } => Some(format!("key:{hop}:{key}")),
+        remote::Prompt::HostKey { .. } => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ask_transfer_remote(
+    tx: &Sender<Event>,
+    generation: u64,
+    cancel: &AtomicBool,
+    cache: &Arc<Mutex<remote::CredentialCache>>,
+    task_cache: &mut remote::CredentialCache,
+    prompt: remote::Prompt,
+) -> std::io::Result<remote::Answer> {
+    let key = credential_key(&prompt);
+    if let Some(key) = &key
+        && let Some(answer) = task_cache.get(key)
+    {
+        return Ok(Some(answer));
+    }
+    let answer = ask_remote(tx, generation, cancel, cache, prompt)?;
+    if let (Some(key), Some(value)) = (key, &answer) {
+        task_cache.put(&key, value.clone());
+    }
+    Ok(answer)
+}
+
 fn ask_remote(
     tx: &Sender<Event>,
     generation: u64,
@@ -445,12 +475,10 @@ fn ask_remote(
     cache: &Arc<Mutex<remote::CredentialCache>>,
     prompt: remote::Prompt,
 ) -> std::io::Result<remote::Answer> {
-    let is_secret = !matches!(prompt, remote::Prompt::HostKey { .. });
-    let hop = match &prompt {
-        remote::Prompt::Secret { hop } | remote::Prompt::HostKey { hop, .. } => hop.clone(),
-        remote::Prompt::KeyPassphrase { hop, key } => format!("key:{hop}:{key}"),
-    };
-    if is_secret && let Some(answer) = cache.lock().unwrap().get(&hop) {
+    let key = credential_key(&prompt);
+    if let Some(key) = &key
+        && let Some(answer) = cache.lock().unwrap().get(key)
+    {
         return Ok(Some(answer));
     }
     let (reply, answer) = mpsc::channel();
@@ -466,8 +494,8 @@ fn ask_remote(
         }
         match answer.recv_timeout(Duration::from_millis(50)) {
             Ok(Some(value)) => {
-                if is_secret {
-                    cache.lock().unwrap().put(&hop, value.clone());
+                if let Some(key) = &key {
+                    cache.lock().unwrap().put(key, value.clone());
                 }
                 return Ok(Some(value));
             }
@@ -615,6 +643,7 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
     ui.set_progress(0.0);
     ui.set_status(format!("正在下载 {} 个项目…", sources.len()).into());
     let diagnostic_enabled = ui.get_diagnostic_mode();
+    let mut task_credentials = credentials.lock().unwrap().for_transfer();
     let worker = thread::spawn(move || {
         let mut diagnostic = |text: &str| {
             let _ = tx.send(Event::RemoteDiagnostic(generation, text.to_string()));
@@ -638,7 +667,16 @@ fn start_remote_download(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, 
                     } else {
                         None
                     },
-                    |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
+                    |prompt| {
+                        ask_transfer_remote(
+                            &tx,
+                            generation,
+                            &cancel,
+                            &credentials,
+                            &mut task_credentials,
+                            prompt,
+                        )
+                    },
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -684,6 +722,7 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
         .into(),
     );
     let diagnostic_enabled = ui.get_diagnostic_mode();
+    let mut task_credentials = credentials.lock().unwrap().for_transfer();
     let worker = thread::spawn(move || {
         let mut diagnostic = |text: &str| {
             let _ = tx.send(Event::RemoteDiagnostic(generation, text.to_string()));
@@ -706,7 +745,16 @@ fn start_remote_upload(ui: &AppWindow, state: &Shared, sources: Vec<PathBuf>, ta
                     } else {
                         None
                     },
-                    |prompt| ask_remote(&tx, generation, &cancel, &credentials, prompt),
+                    |prompt| {
+                        ask_transfer_remote(
+                            &tx,
+                            generation,
+                            &cancel,
+                            &credentials,
+                            &mut task_credentials,
+                            prompt,
+                        )
+                    },
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -1379,6 +1427,31 @@ mod ui_tests {
     use super::*;
     use i_slint_backend_testing::{ElementHandle, TestingBackend, TestingBackendOptions};
     use slint::{LogicalPosition, LogicalSize, platform::PointerEventButton};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transfer_reuses_new_credentials_after_shared_cache_is_cleared() {
+        let (tx, rx) = mpsc::channel();
+        let cache = Arc::new(Mutex::new(remote::CredentialCache::default()));
+        let mut task = cache.lock().unwrap().for_transfer();
+        let responder = thread::spawn(move || {
+            let Event::RemotePrompt(_, _, reply) = rx.recv().unwrap() else {
+                panic!("expected prompt")
+            };
+            reply.send(Some(Zeroizing::new("secret".into()))).unwrap();
+        });
+        let cancel = AtomicBool::new(false);
+        let prompt = || remote::Prompt::Secret {
+            hop: "user@host:22".into(),
+        };
+        let answer = ask_transfer_remote(&tx, 1, &cancel, &cache, &mut task, prompt()).unwrap();
+        assert_eq!(answer.unwrap().as_str(), "secret");
+        responder.join().unwrap();
+        cache.lock().unwrap().clear();
+        // The receiver is now closed: any repeated UI prompt would fail.
+        let answer = ask_transfer_remote(&tx, 1, &cancel, &cache, &mut task, prompt()).unwrap();
+        assert_eq!(answer.unwrap().as_str(), "secret");
+    }
 
     #[test]
     fn host_key_acceptance_never_becomes_a_cached_password() {
