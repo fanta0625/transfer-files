@@ -50,6 +50,7 @@ pub fn file_name(path: &str) -> io::Result<String> {
 pub struct CredentialCache {
     entries: std::collections::HashMap<String, (Zeroizing<String>, Option<std::time::Instant>)>,
     policy: crate::config::CachePolicy,
+    initial_once: std::collections::HashMap<String, Zeroizing<String>>,
 }
 impl CredentialCache {
     /// Keep currently valid credentials for one active transfer, including its
@@ -63,6 +64,7 @@ impl CredentialCache {
             crate::config::CachePolicy::Session
         };
         Self {
+            initial_once: std::mem::take(&mut self.initial_once),
             entries: self
                 .entries
                 .iter()
@@ -79,6 +81,7 @@ impl CredentialCache {
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.initial_once.clear();
     }
     pub fn expire(&mut self) {
         self.entries
@@ -86,7 +89,18 @@ impl CredentialCache {
     }
     pub fn get(&mut self, hop: &str) -> Option<Zeroizing<String>> {
         self.expire();
+        if let Some(value) = self.initial_once.remove(hop) {
+            return Some(value);
+        }
         self.entries.get(hop).map(|(value, _)| value.clone())
+    }
+    /// Settings may supply a credential before its first authentication prompt.
+    pub fn put_initial(&mut self, hop: &str, value: Zeroizing<String>) {
+        if self.policy == crate::config::CachePolicy::Once {
+            self.initial_once.insert(hop.into(), value);
+        } else {
+            self.put(hop, value);
+        }
     }
     pub fn put(&mut self, hop: &str, value: Zeroizing<String>) {
         use crate::config::CachePolicy;
@@ -196,6 +210,37 @@ pub fn parent_path(path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preset_password_obeys_cache_policy_and_transfers_once() {
+        use crate::config::CachePolicy;
+        for policy in [
+            CachePolicy::Once,
+            CachePolicy::FiveMinutes,
+            CachePolicy::Session,
+        ] {
+            let mut cache = CredentialCache::default();
+            cache.set_policy(policy);
+            cache.put_initial("hop", Zeroizing::new("preset".into()));
+            assert!(cache.get("other-hop").is_none());
+            assert_eq!(cache.get("hop").unwrap().as_str(), "preset");
+            assert_eq!(cache.get("hop").is_some(), policy != CachePolicy::Once);
+            if policy == CachePolicy::FiveMinutes {
+                cache.entries.get_mut("hop").unwrap().1 = Some(std::time::Instant::now());
+                assert!(cache.get("hop").is_none());
+            }
+        }
+        let mut cache = CredentialCache::default();
+        cache.set_policy(CachePolicy::Once);
+        cache.put_initial("hop", Zeroizing::new("preset".into()));
+        let mut task = cache.for_transfer();
+        assert!(cache.get("hop").is_none());
+        assert_eq!(task.get("hop").unwrap().as_str(), "preset");
+        assert!(task.get("hop").is_none());
+        cache.put_initial("hop", Zeroizing::new("discard".into()));
+        cache.clear();
+        assert!(cache.get("hop").is_none());
+    }
+
     #[test]
     fn transfer_credentials_survive_shared_expiry_but_exclude_expired_entries() {
         let mut cache = CredentialCache::default();

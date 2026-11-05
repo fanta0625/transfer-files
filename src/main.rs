@@ -206,6 +206,27 @@ fn paint_selection(ui: &AppWindow, state: &Shared, side: usize) {
     ui.set_revision(ui.get_revision().wrapping_add(1));
 }
 
+fn settings_passwords(ui: &AppWindow) -> Vec<Zeroizing<String>> {
+    let mut values: Vec<_> = ui
+        .get_setting_hops()
+        .iter()
+        .map(|row| Zeroizing::new(row.password.to_string()))
+        .collect();
+    values.push(Zeroizing::new(ui.get_setting_target_password().to_string()));
+    values
+}
+
+fn clear_settings_passwords(ui: &AppWindow) {
+    ui.set_setting_target_password("".into());
+    let rows = ui.get_setting_hops();
+    for index in 0..rows.row_count() {
+        if let Some(mut row) = rows.row_data(index) {
+            row.password = "".into();
+            rows.set_row_data(index, row);
+        }
+    }
+}
+
 fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
     ui.set_setting_tab_name(config.name.clone().into());
     ui.set_setting_target_system(if config.target_options.os == RemoteOs::Windows {
@@ -213,6 +234,7 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
     } else {
         0
     });
+    clear_settings_passwords(ui);
     ui.set_setting_target_identity(config.target_options.identity_file.clone().into());
     ui.set_setting_target_auth_mode(config.target_options.auth_mode);
     ui.set_setting_target_proxy_command(config.target_options.proxy_command.clone().into());
@@ -225,6 +247,7 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
             .into_iter()
             .enumerate()
             .map(|(index, node)| HopRow {
+                password: "".into(),
                 auth_mode: config
                     .hop_options
                     .get(index)
@@ -825,6 +848,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
             0 if rows.len() < 7 => rows.push(HopRow {
                 system: 0,
                 identity: "".into(),
+                password: "".into(),
                 auth_mode: 0,
                 proxy_command: "".into(),
                 host: "".into(),
@@ -880,6 +904,7 @@ fn wire(ui: &AppWindow, state: &Shared) {
     ui.on_cancel_settings(move || {
         let ui = weak.unwrap();
         if !ui.get_choosing_identity() {
+            clear_settings_passwords(&ui);
             ui.set_settings_visible(false);
         }
     });
@@ -972,6 +997,17 @@ fn wire(ui: &AppWindow, state: &Shared) {
                             .unwrap()
                             .set_policy(config.cache_policy);
                         state.credentials.lock().unwrap().clear();
+                        let nodes = config.nodes().expect("validated configuration");
+                        let passwords = settings_passwords(&ui);
+                        {
+                            let mut credentials = state.credentials.lock().unwrap();
+                            for (node, password) in nodes.iter().zip(passwords) {
+                                if node.options.auth_mode == 2 && !password.is_empty() {
+                                    credentials.put_initial(&node.label(), password);
+                                }
+                            }
+                        }
+                        clear_settings_passwords(&ui);
                         ui.set_remote_label(config.windows_host.clone().into());
                         state.remote_config = config;
                         state.panes[1].remote = true;
@@ -1599,7 +1635,13 @@ mod ui_tests {
         ui.window().set_size(LogicalSize::new(1180.0, 800.0));
         let (tx, rx) = mpsc::channel();
         let state = Rc::new(RefCell::new(State {
-            config_writer: None,
+            config_writer: Some({
+                let path = root.path().join("settings.json");
+                Rc::new(move |config| {
+                    std::fs::write(&path, serde_json::to_vec(config).unwrap())?;
+                    Ok(path.clone())
+                })
+            }),
             panes: [
                 Pane {
                     path: left.clone(),
@@ -1858,7 +1900,60 @@ mod ui_tests {
         ui.window().set_size(slint::LogicalSize::new(920.0, 620.0));
         snapshot(&ui, "remote-settings-small.png");
         ui.window().set_size(slint::LogicalSize::new(1180.0, 800.0));
+        for policy in [0, 1, 2] {
+            ui.set_settings_visible(true);
+            ui.set_setting_cache_policy(policy);
+            ui.set_setting_target_auth_mode(2);
+            ui.set_setting_target_password("target-preset".into());
+            let rows = ui.get_setting_hops();
+            let mut hop = rows.row_data(0).unwrap();
+            hop.auth_mode = 2;
+            hop.password = "hop-preset".into();
+            rows.set_row_data(0, hop.clone());
+            let before = ui.window().take_snapshot().unwrap();
+            hop.password = "new-preset".into();
+            rows.set_row_data(0, hop.clone());
+            let after = ui.window().take_snapshot().unwrap();
+            assert!(
+                before.as_bytes() == after.as_bytes(),
+                "settings passwords must be masked"
+            );
+            hop.password = "hop-preset".into();
+            rows.set_row_data(0, hop);
+            snapshot(&ui, "remote-settings-password.png");
+            ui.invoke_save_settings(
+                ui.get_setting_jump_host(),
+                ui.get_setting_jump_port(),
+                ui.get_setting_jump_user(),
+                ui.get_setting_windows_host(),
+                ui.get_setting_windows_port(),
+                ui.get_setting_windows_user(),
+                ui.get_setting_windows_root(),
+                ui.get_setting_route(),
+            );
+            assert!(!ui.get_settings_visible());
+            assert!(ui.get_setting_target_password().is_empty());
+            assert!(
+                ui.get_setting_hops()
+                    .iter()
+                    .all(|row| row.password.is_empty())
+            );
+            let saved = std::fs::read_to_string(root.path().join("settings.json")).unwrap();
+            assert!(!saved.contains("preset"));
+            let state = state.borrow();
+            let nodes = state.remote_config.nodes().unwrap();
+            let mut cache = state.credentials.lock().unwrap();
+            assert_eq!(cache.get(&nodes[0].label()).unwrap().as_str(), "hop-preset");
+            assert_eq!(
+                cache.get(&nodes.last().unwrap().label()).unwrap().as_str(),
+                "target-preset"
+            );
+            assert_eq!(cache.get(&nodes[0].label()).is_some(), policy != 2);
+        }
+        ui.set_settings_visible(true);
+        ui.set_setting_target_password("cancelled".into());
         ui.invoke_cancel_settings();
+        assert!(ui.get_setting_target_password().is_empty());
         ui.window().set_size(LogicalSize::new(920.0, 700.0));
         snapshot(&ui, "prototype-small-window.png");
         ui.hide().unwrap();
