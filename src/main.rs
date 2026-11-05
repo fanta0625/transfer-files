@@ -212,6 +212,8 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
         0
     });
     ui.set_setting_target_identity(config.target_options.identity_file.clone().into());
+    ui.set_setting_target_auth_mode(config.target_options.auth_mode);
+    ui.set_setting_target_proxy_command(config.target_options.proxy_command.clone().into());
     ui.set_setting_cache_policy(config.cache_policy.index());
     ui.set_setting_route(config.route_text().into());
     ui.set_setting_hops(ModelRc::new(VecModel::from(
@@ -221,6 +223,17 @@ fn paint_remote_config(ui: &AppWindow, config: &RemoteConfig) {
             .into_iter()
             .enumerate()
             .map(|(index, node)| HopRow {
+                auth_mode: config
+                    .hop_options
+                    .get(index)
+                    .map(|o| o.auth_mode)
+                    .unwrap_or(0),
+                proxy_command: config
+                    .hop_options
+                    .get(index)
+                    .map(|o| o.proxy_command.clone())
+                    .unwrap_or_default()
+                    .into(),
                 system: if config
                     .hop_options
                     .get(index)
@@ -787,6 +800,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
             0 if rows.len() < 7 => rows.push(HopRow {
                 system: 0,
                 identity: "".into(),
+                auth_mode: 0,
+                proxy_command: "".into(),
                 host: "".into(),
                 user: "".into(),
                 port: "22".into(),
@@ -879,6 +894,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
                             RemoteOs::Linux
                         },
                         identity_file: row.identity.trim().into(),
+                        auth_mode: row.auth_mode,
+                        proxy_command: row.proxy_command.trim().into(),
                     })
                     .collect(),
                 target_options: NodeOptions {
@@ -888,6 +905,8 @@ fn wire(ui: &AppWindow, state: &Shared) {
                         RemoteOs::Linux
                     },
                     identity_file: ui.get_setting_target_identity().trim().into(),
+                    auth_mode: ui.get_setting_target_auth_mode(),
+                    proxy_command: ui.get_setting_target_proxy_command().trim().into(),
                 },
                 cache_policy: CachePolicy::from_index(ui.get_setting_cache_policy()),
                 route: Some(route.join("\n")),

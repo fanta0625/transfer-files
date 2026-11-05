@@ -39,11 +39,7 @@ pub(crate) const OPTIONS: &[&str] = &[
     "-o",
     "ForwardX11=no",
     "-o",
-    "ProxyCommand=none",
-    "-o",
     "ProxyJump=none",
-    "-o",
-    "PreferredAuthentications=publickey,password",
     "-o",
     "BatchMode=no",
     "-o",
@@ -654,6 +650,68 @@ os.execv('/bin/sh',['sh','-c',args[-1]])
                 |prompt| {
                     let Prompt::Secret { hop } = prompt else {
                         panic!("unexpected host key");
+                    };
+                    let index = seen.len();
+                    assert_eq!(hop, nodes[index].label());
+                    seen.push(hop);
+                    Ok(Some(Zeroizing::new(format!(
+                        "secret-{}",
+                        nodes[index].host
+                    ))))
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(result.contains("finished"));
+            assert_eq!(seen.len(), count);
+        }
+    }
+
+    #[test]
+    fn mixed_key_passphrase_and_password_identify_each_node() {
+        use crate::config::SshNode;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fake = temp.path().join("ssh");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/python3
+import sys,os,termios
+args=sys.argv[1:]
+host=args[args.index('--')+1]
+attrs=termios.tcgetattr(0); attrs[3] &= ~termios.ECHO; termios.tcsetattr(0,termios.TCSANOW,attrs)
+if host == 'node0.test':
+    print("Enter passphrase for key '/tmp/key': ",end="",flush=True)
+else:
+    print("user@"+host+"'s password: ",end="",flush=True)
+assert input() == "secret-"+host
+os.execv('/bin/sh',['sh','-c',args[-1]])
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for count in [1, 2, 4] {
+            let nodes: Vec<_> = (0..count)
+                .map(|i| SshNode {
+                    host: format!("node{i}.test"),
+                    port: format!("{}", 2200 + i),
+                    user: "user".into(),
+                    options: crate::config::NodeOptions::linux(),
+                })
+                .collect();
+            let mut cmd = chain_command(&nodes, "printf 'finished\\n'", "test", false);
+            cmd.get_argv_mut()[0] = fake.clone().into_os_string();
+            cmd.env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()));
+            let mut seen = Vec::new();
+            let result = run_command(
+                cmd,
+                "test",
+                &AtomicBool::new(false),
+                |prompt| {
+                    let hop = match prompt {
+                        Prompt::KeyPassphrase { hop, .. } if seen.is_empty() => hop,
+                        Prompt::Secret { hop } if !seen.is_empty() => hop,
+                        _ => panic!("wrong credential kind"),
                     };
                     let index = seen.len();
                     assert_eq!(hop, nodes[index].label());

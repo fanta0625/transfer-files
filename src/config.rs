@@ -14,16 +14,20 @@ pub enum RemoteOs {
     Windows,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeOptions {
     pub os: RemoteOs,
     /// On the computer initiating this SSH connection, never copied between nodes.
     pub identity_file: String,
+    pub auth_mode: i32,
+    pub proxy_command: String,
 }
 impl NodeOptions {
     pub fn linux() -> Self {
         Self {
             os: RemoteOs::Linux,
             identity_file: String::new(),
+            ..Default::default()
         }
     }
 }
@@ -310,6 +314,12 @@ impl SshNode {
         format!("{}@{}:{}", self.user, self.host, self.port)
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.options.proxy_command.chars().any(char::is_control) {
+            return Err("ProxyCommand cannot contain control characters".into());
+        }
+        if !(0..=2).contains(&self.options.auth_mode) {
+            return Err("Invalid authentication mode".into());
+        }
         if self.options.identity_file.chars().any(char::is_control) {
             return Err("私钥路径不能包含控制字符".into());
         }
@@ -366,10 +376,13 @@ mod tests {
         config.hop_options = vec![NodeOptions {
             os: RemoteOs::Windows,
             identity_file: "/home/me/密钥 key".into(),
+            auth_mode: 1,
+            proxy_command: "nc -X 5 -x 127.0.0.1:1055 %h %p".into(),
         }];
         config.target_options = NodeOptions {
             os: RemoteOs::Linux,
             identity_file: "C:/Users/me/.ssh/id_ed25519".into(),
+            ..Default::default()
         };
         config.cache_policy = CachePolicy::Session;
         let loaded = RemoteConfig::from_contents(&config.to_contents());

@@ -83,3 +83,12 @@ bash scripts/test-transfer.sh
 TF_TEST_WINDOWS_SFTP_SERVER=/mnt/c/Windows/System32/OpenSSH/sftp-server.exe \
   cargo test --locked real_windows_sftp_drive_paths_and_resume -- --ignored
 ```
+
+
+### 节点认证与 SOCKS5 代理
+
+每个中转节点和目标可独立选择自动、仅密钥或仅密码。仅密码跳过公钥认证；自动允许公钥、交互式密码和普通密码。私钥口令与登录密码分别缓存，5 分钟缓存从输入凭据后开始，首次连接仍需输入。
+
+每个节点可填写 ProxyCommand，例如 `nc -X 5 -x 127.0.0.1:1055 %h %p`（不加外层引号或 `ssh -o`）。直连 `xin@tian-xin` 时将目标主机设为 `tian-xin`，用户名设为 `xin`，端口设为 `22`，填写上述命令。浏览和 SFTP 传输均使用该设置。
+
+命令在发起该段连接的电脑执行：首节点在本机，后续节点在上一台跳板机；`127.0.0.1` 也指那台电脑。该电脑须安装支持这些参数的 `nc`。配置只应填写自己信任的代理命令。

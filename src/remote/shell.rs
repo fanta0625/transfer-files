@@ -22,16 +22,35 @@ pub(crate) fn ps_command(script: &str) -> String {
 }
 
 pub(crate) fn identity_args(node: &SshNode) -> Vec<String> {
-    if node.options.identity_file.is_empty() {
-        Vec::new()
-    } else {
-        vec![
+    let mut args = vec![
+        "-o".into(),
+        format!(
+            "ProxyCommand={}",
+            if node.options.proxy_command.is_empty() {
+                "none"
+            } else {
+                &node.options.proxy_command
+            }
+        ),
+        "-o".into(),
+        match node.options.auth_mode {
+            1 => "PreferredAuthentications=publickey",
+            2 => "PreferredAuthentications=keyboard-interactive,password",
+            _ => "PreferredAuthentications=publickey,keyboard-interactive,password",
+        }
+        .into(),
+    ];
+    if node.options.auth_mode == 2 {
+        args.extend(["-o".into(), "PubkeyAuthentication=no".into()]);
+    } else if !node.options.identity_file.is_empty() {
+        args.extend([
             "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-i".into(),
             node.options.identity_file.clone(),
-        ]
+        ]);
     }
+    args
 }
 /// Windows native argv quoting (PowerShell 5.1's `& ... @args` loses embedded quotes).
 pub(crate) fn windows_arg(arg: &str) -> String {
@@ -85,15 +104,29 @@ mod tests {
     #[test]
     fn identities_and_native_arguments() {
         let mut node = SshNode::default();
-        assert!(identity_args(&node).is_empty());
+        assert!(identity_args(&node).contains(&"ProxyCommand=none".into()));
         node.options.identity_file = "C:/Users/a b/key".into();
         assert_eq!(
-            identity_args(&node),
+            identity_args(&node)[4..],
             ["-o", "IdentitiesOnly=yes", "-i", "C:/Users/a b/key"]
         );
         assert_eq!(windows_arg("a\"b\\"), "\"a\\\"b\\\\\"");
         assert_eq!(quote("a'b"), "'a'\\''b'");
     }
+    #[test]
+    fn proxy_and_password_options_are_independent_of_identity() {
+        let mut node = SshNode::default();
+        node.options.identity_file = "/tmp/key".into();
+        node.options.auth_mode = 2;
+        node.options.proxy_command = "nc -X 5 -x 127.0.0.1:1055 %h %p".into();
+        let args = identity_args(&node);
+        assert!(args.contains(&format!("ProxyCommand={}", node.options.proxy_command)));
+        assert!(args.contains(&"PubkeyAuthentication=no".into()));
+        assert!(!args.contains(&"-i".into()));
+        node.options.auth_mode = 1;
+        assert!(identity_args(&node).contains(&"PreferredAuthentications=publickey".into()));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_bootstrap_and_nested_launcher_work_in_both_default_shells() {

@@ -2,7 +2,7 @@ import { Button, ComboBox, CheckBox, LineEdit, ProgressIndicator, ListView, Scro
 
 export struct RemoteTabRow { title: string, busy: bool, attention: bool }
 
-export struct HopRow { host: string, user: string, port: string, system: int, identity: string }
+export struct HopRow { host: string, user: string, port: string, system: int, identity: string, auth-mode: int, proxy-command: string }
 
 export struct FileRow {
     name: string,
@@ -165,6 +165,8 @@ export component AppWindow inherits Window {
     callback clear-transfer-log();
     in-out property <int> setting-target-system: 1;
     in-out property <string> setting-target-identity;
+    in-out property <int> setting-target-auth-mode;
+    in-out property <string> setting-target-proxy-command;
     in-out property <int> setting-cache-policy;
     in-out property <string> setting-route;
     in-out property <[HopRow]> setting-hops;
@@ -390,8 +392,10 @@ export component AppWindow inherits Window {
                       HorizontalLayout {
                         ComboBox { model: ["Linux", "Windows"]; current-index <=> hop.system; width: 120px; }
                         Text { text: "私钥"; vertical-alignment: center; }
+                        ComboBox { model: ["自动", "仅密钥", "仅密码"]; current-index <=> hop.auth-mode; width: 100px; }
                         LineEdit { text <=> hop.identity; placeholder-text: "连接发起端上的私钥路径，留空使用默认密钥 / 密码"; }
                       }
+                      LineEdit { text <=> hop.proxy-command; placeholder-text: "ProxyCommand（可选）：nc -X 5 -x 127.0.0.1:1055 %h %p"; }
                     }
                 }
                 HorizontalLayout {
@@ -420,14 +424,16 @@ export component AppWindow inherits Window {
                     Text { text: "目标系统"; width: 76px; vertical-alignment: center; }
                     ComboBox { model: ["Linux", "Windows"]; current-index <=> root.setting-target-system; width: 120px; }
                     Text { text: "私钥"; vertical-alignment: center; }
+                    ComboBox { model: ["自动", "仅密钥", "仅密码"]; current-index <=> root.setting-target-auth-mode; width: 100px; }
                     LineEdit { text <=> root.setting-target-identity; placeholder-text: "留空使用默认密钥 / 密码"; }
                 }
+                LineEdit { text <=> root.setting-target-proxy-command; placeholder-text: "ProxyCommand（可选）：nc -X 5 -x 127.0.0.1:1055 %h %p"; }
                 HorizontalLayout {
                     Text { text: "密码缓存"; width: 76px; vertical-alignment: center; }
                     ComboBox { model: ["5 分钟过期", "永不过期（退出程序清除）", "一次性（不缓存）"]; current-index <=> root.setting-cache-policy; }
                 }
                 Text {
-                    text: "私钥须位于发起连接的上一台电脑，首节点使用本机私钥。Linux 需 Python 3；Windows 需 PowerShell。中断后重新选择相同源与目标即可校验续传。";
+                    text: "私钥和 ProxyCommand 在上一台电脑执行，首节点使用本机。首次输入密码后才开始缓存。Linux 需 Python 3；Windows 需 PowerShell。中断后重新选择相同源与目标即可校验续传。";
                     color: #8a5a20; font-size: 12px; wrap: word-wrap;
                 }
                   }
