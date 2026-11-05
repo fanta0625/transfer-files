@@ -412,6 +412,14 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout {
                     spacing: 8px;
+                    Text { text: "ProxyCommand"; width: 110px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.setting-target-proxy-command;
+                        placeholder-text: "可选：nc -X 5 -x 127.0.0.1:1055 %h %p";
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
                     Text { text: "用户名"; width: 76px; vertical-alignment: center; }
                     LineEdit { text <=> root.setting-windows-user; placeholder-text: "目标 SSH 用户"; }
                 }
@@ -427,7 +435,6 @@ export component AppWindow inherits Window {
                     ComboBox { model: ["自动", "仅密钥", "仅密码"]; current-index <=> root.setting-target-auth-mode; width: 100px; }
                     LineEdit { text <=> root.setting-target-identity; placeholder-text: "留空使用默认密钥 / 密码"; }
                 }
-                LineEdit { text <=> root.setting-target-proxy-command; placeholder-text: "ProxyCommand（可选）：nc -X 5 -x 127.0.0.1:1055 %h %p"; }
                 HorizontalLayout {
                     Text { text: "密码缓存"; width: 76px; vertical-alignment: center; }
                     ComboBox { model: ["5 分钟过期", "永不过期（退出程序清除）", "一次性（不缓存）"]; current-index <=> root.setting-cache-policy; }
