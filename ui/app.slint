@@ -171,6 +171,8 @@ export component AppWindow inherits Window {
     in-out property <string> setting-route;
     in-out property <[HopRow]> setting-hops;
     callback change-hop(int, int);
+    callback choose-identity(int);
+    in-out property <bool> choosing-identity: false;
     in property <string> remote-label;
     in-out property <string> setting-jump-host;
     in-out property <string> setting-jump-port;
@@ -391,9 +393,10 @@ export component AppWindow inherits Window {
                       }
                       HorizontalLayout {
                         ComboBox { model: ["Linux", "Windows"]; current-index <=> hop.system; width: 120px; }
-                        Text { text: "私钥"; vertical-alignment: center; }
+                        Text { text: "私钥文件"; vertical-alignment: center; }
                         ComboBox { model: ["自动", "仅密钥", "仅密码"]; current-index <=> hop.auth-mode; width: 100px; }
-                        LineEdit { text <=> hop.identity; placeholder-text: "连接发起端上的私钥路径，留空使用默认密钥 / 密码"; }
+                        LineEdit { text <=> hop.identity; enabled: hop.auth-mode != 2; placeholder-text: hop.auth-mode == 2 ? "密码在连接时弹窗输入" : "私钥文件路径（不是密码），留空使用默认密钥"; }
+                        Button { text: "浏览…"; enabled: index == 0 && hop.auth-mode != 2; clicked => { root.choose-identity(index); } }
                       }
                       LineEdit { text <=> hop.proxy-command; placeholder-text: "ProxyCommand（可选）：nc -X 5 -x 127.0.0.1:1055 %h %p"; }
                     }
@@ -431,16 +434,17 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     Text { text: "目标系统"; width: 76px; vertical-alignment: center; }
                     ComboBox { model: ["Linux", "Windows"]; current-index <=> root.setting-target-system; width: 120px; }
-                    Text { text: "私钥"; vertical-alignment: center; }
+                    Text { text: "私钥文件"; vertical-alignment: center; }
                     ComboBox { model: ["自动", "仅密钥", "仅密码"]; current-index <=> root.setting-target-auth-mode; width: 100px; }
-                    LineEdit { text <=> root.setting-target-identity; placeholder-text: "留空使用默认密钥 / 密码"; }
+                    LineEdit { text <=> root.setting-target-identity; enabled: root.setting-target-auth-mode != 2; placeholder-text: root.setting-target-auth-mode == 2 ? "密码在连接时弹窗输入" : "私钥文件路径（不是密码）"; }
+                    Button { text: "浏览…"; enabled: root.setting-hops.length == 0 && root.setting-target-auth-mode != 2; clicked => { root.choose-identity(-1); } }
                 }
                 HorizontalLayout {
                     Text { text: "密码缓存"; width: 76px; vertical-alignment: center; }
                     ComboBox { model: ["5 分钟过期", "永不过期（退出程序清除）", "一次性（不缓存）"]; current-index <=> root.setting-cache-policy; }
                 }
                 Text {
-                    text: "私钥和 ProxyCommand 在上一台电脑执行，首节点使用本机。首次输入密码后才开始缓存。Linux 需 Python 3；Windows 需 PowerShell。中断后重新选择相同源与目标即可校验续传。";
+                    text: "浏览仅选择本机私钥文件；后续节点须手填上一台跳板上的路径。私钥路径会保存，密码和私钥口令在连接时弹窗输入，退出后清除。ProxyCommand 也在上一台电脑执行，首节点使用本机。Linux 需 Python 3；Windows 需 PowerShell。中断后重新选择相同源与目标即可校验续传。";
                     color: #8a5a20; font-size: 12px; wrap: word-wrap;
                 }
                   }
@@ -470,6 +474,12 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.choosing-identity : Rectangle {
+        width: root.width; height: root.height;
+        background: #00000033;
+        TouchArea { }
+    }
+
     if root.auth-visible : Rectangle {
         width: root.width; height: root.height; background: #00000066;
         TouchArea { } // Block the underlying file panes while authenticating.
@@ -480,10 +490,26 @@ export component AppWindow inherits Window {
                 padding: 22px; spacing: 14px;
                 Text { text: root.auth-title; font-size: 20px; font-weight: 700; color: #173b3d; }
                 TextEdit { text: root.auth-detail; read-only: true; font-size: 13px; }
-                if !root.auth-host-key : LineEdit {
-                    text <=> root.auth-secret; input-type: password;
-                    placeholder-text: "密码或私钥口令（不保存）";
-                    accepted => { root.auth-submit(); }
+                if !root.auth-host-key : Rectangle {
+                    height: 40px;
+                    border-width: 1px;
+                    border-color: secret-input.has-focus ? #178477 : #c7d4d8;
+                    border-radius: 4px;
+                    clip: true;
+                    Text {
+                        x: 10px; width: parent.width - 20px; height: parent.height;
+                        text: root.auth-secret == "" ? "请输入密码或私钥口令（掩码显示）" : "";
+                        color: #667782; vertical-alignment: center;
+                    }
+                    secret-input := TextInput {
+                        x: 10px; width: parent.width - 20px; height: parent.height;
+                        text <=> root.auth-secret;
+                        input-type: InputType.password;
+                        single-line: true;
+                        vertical-alignment: center;
+                        color: #182d38;
+                        accepted => { root.auth-submit(); }
+                    }
                 }
                 HorizontalLayout {
                     spacing: 10px; Rectangle { horizontal-stretch: 1; }

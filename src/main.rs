@@ -1,4 +1,5 @@
 mod config;
+mod file_dialog;
 mod files;
 mod remote;
 mod tabs;
@@ -37,6 +38,7 @@ struct Pane {
 }
 
 enum Event {
+    IdentitySelected(i32, Result<Option<String>, String>),
     Directory(usize, u64, std::io::Result<(PathBuf, Vec<files::Entry>)>),
     RemotePrompt(u64, remote::Prompt, Sender<remote::Answer>),
     Progress(files::Progress),
@@ -792,8 +794,31 @@ fn wire(ui: &AppWindow, state: &Shared) {
         .unwrap()
         .set_policy(state.borrow().remote_config.cache_policy);
     let weak = ui.as_weak();
+    let picker_tx = state.borrow().tx.clone();
+    ui.on_choose_identity(move |index| {
+        let ui = weak.unwrap();
+        if ui.get_choosing_identity()
+            || (index == -1 && ui.get_setting_hops().row_count() != 0)
+            || (index != -1 && index != 0)
+        {
+            return;
+        }
+        ui.set_choosing_identity(true);
+        ui.set_settings_error("".into());
+        let tx = picker_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(Event::IdentitySelected(
+                index,
+                file_dialog::choose_private_key(),
+            ));
+        });
+    });
+    let weak = ui.as_weak();
     ui.on_change_hop(move |action, index| {
         let ui = weak.unwrap();
+        if ui.get_choosing_identity() {
+            return;
+        }
         let mut rows: Vec<_> = ui.get_setting_hops().iter().collect();
         let index = index as usize;
         match action {
@@ -852,7 +877,12 @@ fn wire(ui: &AppWindow, state: &Shared) {
         ui.set_settings_visible(true);
     });
     let weak = ui.as_weak();
-    ui.on_cancel_settings(move || weak.unwrap().set_settings_visible(false));
+    ui.on_cancel_settings(move || {
+        let ui = weak.unwrap();
+        if !ui.get_choosing_identity() {
+            ui.set_settings_visible(false);
+        }
+    });
     let weak = ui.as_weak();
     let shared = state.clone();
     ui.on_save_settings(
@@ -868,6 +898,9 @@ fn wire(ui: &AppWindow, state: &Shared) {
                 return;
             }
             let ui = weak.unwrap();
+            if ui.get_choosing_identity() {
+                return;
+            }
             let mut route = Vec::new();
             for (index, row) in ui.get_setting_hops().iter().enumerate() {
                 let node = config::SshNode {
@@ -1204,6 +1237,24 @@ fn poll(ui: &AppWindow, state: &Shared, rx: &Receiver<Event>) {
             break;
         };
         match event {
+            Event::IdentitySelected(index, result) => {
+                ui.set_choosing_identity(false);
+                match result {
+                    Ok(Some(path)) if ui.get_settings_visible() => {
+                        if index == -1 {
+                            ui.set_setting_target_identity(path.into());
+                        } else {
+                            let rows = ui.get_setting_hops();
+                            if let Some(mut row) = rows.row_data(index as usize) {
+                                row.identity = path.into();
+                                rows.set_row_data(index as usize, row);
+                            }
+                        }
+                    }
+                    Err(error) => ui.set_settings_error(error.into()),
+                    _ => {}
+                }
+            }
             Event::RemotePrompt(generation, prompt, reply) => {
                 let mut state = state.borrow_mut();
                 if generation != state.panes[1].generation
@@ -1743,6 +1794,14 @@ mod ui_tests {
         poll(&ui, &state, &rx);
         ui.set_auth_secret("ui-test-secret".into());
         snapshot(&ui, "remote-auth.png");
+        let masked_before = ui.window().take_snapshot().unwrap();
+        ui.set_auth_secret("another-secret".into());
+        let masked_after = ui.window().take_snapshot().unwrap();
+        assert!(
+            masked_before.as_bytes() == masked_after.as_bytes(),
+            "same-length passwords must render identically under masking"
+        );
+        ui.set_auth_secret("ui-test-secret".into());
         ui.invoke_auth_submit();
         assert_eq!(answer.recv().unwrap().unwrap().as_str(), "ui-test-secret");
         assert!(ui.get_auth_secret().is_empty());

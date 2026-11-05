@@ -85,7 +85,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: YueTransfer contributors <noreply@example.com>
 Installed-Size: $SIZE
-Depends: $DEPENDS, python3, openssh-client, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
+Depends: $DEPENDS, zenity, python3, openssh-client, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0
 Description: 跃传 (YueTransfer) - cross-platform multi-hop SSH file transfer client
  Dual-pane SSH file browser and transfer client for Linux desktops.
  Supports mixed Windows/Linux hops, independent tabs, verified resumable
